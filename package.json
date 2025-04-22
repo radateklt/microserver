@@ -1,0 +1,31 @@
+{
+  "name": "@radatek/microserver",
+  "version": "2.0.0",
+  "description": "HTTP MicroServer",
+  "author": "Darius Kisonas",
+  "license": "MIT",
+  "keywords": [
+    "http",
+    "microserver",
+    "server",
+    "httpserver"
+  ],
+  "type": "module",
+  "main": "./dist/microserver.js",
+  "module": "./dist/microserver.js",
+  "types": "./dist/microserver.d.ts",
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/radateklt/microserver.git"
+  },
+  "scripts": {
+    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2021 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g' dist/microserver.d.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "undici-types": "^7.8.0"
+  }
+}
