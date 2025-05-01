@@ -11,13 +11,12 @@ import https from 'https'
 import net from 'net'
 import tls from 'tls'
 import querystring from 'querystring'
-import stream, { Readable, Stream } from 'stream'
+import { Readable } from 'stream'
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import zlib from 'zlib'
 import { EventEmitter } from 'events'
-import { Socket } from 'dgram'
 
 const defaultToken = 'wx)>:ZUqVc+E,u0EmkPz%ZW@TFDY^3vm'
 const defaultExpire = 24 * 60 * 60
@@ -86,26 +85,45 @@ interface UploadFiles {
   last?: any
 }
 
+/** Extended http.IncomingMessage */
 export class ServerRequest extends http.IncomingMessage {
+  /** Request protocol: http or https */
   public protocol: string
+  /** Request client IP */
   public ip?: string
+  /** Request from local network */
   public localip?: boolean
+  /** Request is secure (https) */
   public secure?: boolean
+  /** Request whole path */
   public path: string = '/'
+  /** Request pathname */
   public pathname: string = '/'
+  /** Base url */
   public baseUrl: string = '/'
+  /** Original url */
   public originalUrl?: string
+  /** GET parameters */
   public get: { [key: string]: string }
+  /** Router named parameters */
   public params: { [key: string]: string }
+  /** Router named parameters list */
   public paramsList: string[]
+  /** Router */
   public router: Router
+  /** Authentication object */
   public auth?: Auth
+  /** Authenticated user info */
   public user?: UserInfo
+  /** Model used for request */
   public model?: Model
+  /** Authentication token id */
   public tokenId?: string
 
   private _body?: { [key: string]: any }
+  /** Request raw body */
   public rawBody: Buffer[]
+  /** Request raw body size */
   public rawBodySize: number
   
   private constructor (router: Router) {
@@ -129,6 +147,7 @@ export class ServerRequest extends http.IncomingMessage {
     this.updateUrl(this.url || '/')
   }
 
+  /** Update request url */
   updateUrl (url: string) {
     this.url = url
     if (!this.originalUrl)
@@ -142,10 +161,12 @@ export class ServerRequest extends http.IncomingMessage {
     parsedUrl.searchParams.forEach((v, k) => this.get[k] = v)
   }
 
+  /** Rewrite request url */
   rewrite (url: string): void {
     throw new Error('Internal error')
   }
   
+  /** Request body: JSON or POST parameters */
   get body () {
     if (!this._body) {
       if (this.method === 'GET')
@@ -169,12 +190,13 @@ export class ServerRequest extends http.IncomingMessage {
     return this._body
   }
 
-  /** alias to body */
+  /** Alias to body */
   get post () {
     return this.body
   }
 
   private _websocket?: WebSocket
+  /** Get websocket */
   get websocket(): WebSocket {
     if (!this._websocket) {
       if (!this.headers.upgrade)
@@ -212,16 +234,91 @@ export class ServerRequest extends http.IncomingMessage {
     }
   }
 
-  bodyChunkInit(res: ServerResponse, next: () => void) {
+  /** Decode request body */
+  bodyDecode(res: ServerResponse, options: any, next: () => void) {
     const contentType = (this.headers['content-type'] || '').split(';')
-    const maxSize = this.router.server.config.maxBodySize || defaultMaxBodySize
+    const maxSize = options.maxBodySize || defaultMaxBodySize
+
     if (contentType.includes('multipart/form-data')) {
+      const chunkParse = (chunk: Buffer) => {
+        const files: UploadFiles | undefined = this._files
+        if (!files || files.done)
+          return
+        chunk = files.chunk = files.chunk ? Buffer.concat([files.chunk, chunk]) : chunk
+        const p: number = chunk.indexOf(files.boundary) || -1
+        if (p >= 0 && chunk.length - p >= 2) {
+          if (files.last) {
+            if (p > 0)
+              files.last.write(chunk.subarray(0, p))
+            files.last.srtream.close()
+            delete files.last.srtream
+            files.last = undefined
+          }
+          let pe = p + files.boundary.length
+          if (chunk[pe] === 13 && chunk[pe + 1] === 10) {
+            chunk = files.chunk = chunk.subarray(p)
+            // next header
+            pe = chunk.indexOf('\r\n\r\n')
+            if (pe > 0) { // whole header
+              const header = chunk.toString('utf8', files.boundary.length + 2, pe)
+              chunk = chunk.subarray(pe + 4)
+              const fileInfo = header.match(/content-disposition: ([^\r\n]+)/i)
+              const contentType = header.match(/content-type: ([^\r\n;]+)/i)
+              let fieldName: string = '', fileName: string = ''
+              if (fileInfo)
+                fileInfo[1].replace(/(\w+)="?([^";]+)"?/, (_: string, n: string, v: string) => {
+                  if (n === 'name')
+                    fieldName = v
+                  if (n === 'filename')
+                    fileName = v
+                  return _
+                })
+              if (fileName) {
+                let file: string
+                do {
+                  file = path.resolve(path.join(files.uploadDir, crypto.randomBytes(16).toString('hex') + '.tmp'))
+                } while (fs.existsSync(file))
+                files.last = {
+                  name: fieldName,
+                  fileName: fileName,
+                  contentType: contentType && contentType[1],
+                  file: file,
+                  stream: fs.createWriteStream(file)
+                }
+                files.list.push(files.last)
+              } else if (fieldName) {
+                files.last = {
+                  name: fieldName,
+                  stream: {
+                    write: (chunk: Buffer) => {
+                      if (!this._body)
+                        this._body = {}
+                      this._body[fieldName] = (this._body[fieldName] || '') + chunk.toString()
+                    },
+                    close () { }
+                  }
+                }
+              }
+            }
+          } else {
+            files.chunk = undefined
+            files.done = true
+          }
+        } else {
+          if (chunk.length > 8096) {
+            if (files.last)
+              files.last.stream.write(chunk.subarray(0, files.boundary.length - 1))
+            chunk = files.chunk = chunk.subarray(files.boundary.length - 1)
+          }
+        }
+      }
+
       this.pause()
-      res.setHeader('Connection', 'close') // TODO: check if this is needed
+      //res.setHeader('Connection', 'close') // TODO: check if this is needed
       this._body = {}
       const files = this._files = {
         list: [],
-        uploadDir: path.resolve(this.router.server.config.uploadDir || 'upload'),
+        uploadDir: path.resolve(options.uploadDir || 'upload'),
         resolve: NOOP,
         boundary: ''
       }
@@ -235,7 +332,7 @@ export class ServerRequest extends http.IncomingMessage {
         return res.error(400)
       next()
       this.once('error', () => files.resolve(new ResponseError('Request error')))
-        .on('data', chunk => this.bodyChunkDecode(chunk))
+        .on('data', chunk => chunkParse(chunk))
         .once('end', () => files.resolve(new Error('Request error')))
 
       res.on('finish', () => this._removeTempFiles())
@@ -253,80 +350,6 @@ export class ServerRequest extends http.IncomingMessage {
             this.rawBody.push(chunk)
         })
         .once('end', next)
-    }
-  }
-
-  /** Decode multipart/form-data */
-  bodyChunkDecode (chunk: Buffer) {
-    const files: UploadFiles | undefined = this._files
-    if (!files || files.done)
-      return
-    chunk = files.chunk = files.chunk ? Buffer.concat([files.chunk, chunk]) : chunk
-    const p: number = chunk.indexOf(files.boundary) || -1
-    if (p >= 0 && chunk.length - p >= 2) {
-      if (files.last) {
-        if (p > 0)
-          files.last.write(chunk.subarray(0, p))
-        files.last.srtream.close()
-        delete files.last.srtream
-        files.last = undefined
-      }
-      let pe = p + files.boundary.length
-      if (chunk[pe] === 13 && chunk[pe + 1] === 10) {
-        chunk = files.chunk = chunk.subarray(p)
-        // next header
-        pe = chunk.indexOf('\r\n\r\n')
-        if (pe > 0) { // whole header
-          const header = chunk.toString('utf8', files.boundary.length + 2, pe)
-          chunk = chunk.subarray(pe + 4)
-          const fileInfo = header.match(/content-disposition: ([^\r\n]+)/i)
-          const contentType = header.match(/content-type: ([^\r\n;]+)/i)
-          let fieldName: string = '', fileName: string = ''
-          if (fileInfo)
-            fileInfo[1].replace(/(\w+)="?([^";]+)"?/, (_: string, n: string, v: string) => {
-              if (n === 'name')
-                fieldName = v
-              if (n === 'filename')
-                fileName = v
-              return _
-            })
-          if (fileName) {
-            let file: string
-            do {
-              file = path.resolve(path.join(files.uploadDir, crypto.randomBytes(16).toString('hex') + '.tmp'))
-            } while (fs.existsSync(file))
-            files.last = {
-              name: fieldName,
-              fileName: fileName,
-              contentType: contentType && contentType[1],
-              file: file,
-              stream: fs.createWriteStream(file)
-            }
-            files.list.push(files.last)
-          } else if (fieldName) {
-            files.last = {
-              name: fieldName,
-              stream: {
-                write: (chunk: Buffer) => {
-                  if (!this._body)
-                    this._body = {}
-                  this._body[fieldName] = (this._body[fieldName] || '') + chunk.toString()
-                },
-                close () { }
-              }
-            }
-          }
-        }
-      } else {
-        files.chunk = undefined
-        files.done = true
-      }
-    } else {
-      if (chunk.length > 8096) {
-        if (files.last)
-          files.last.stream.write(chunk.subarray(0, files.boundary.length - 1))
-        chunk = files.chunk = chunk.subarray(files.boundary.length - 1)
-      }
     }
   }
 
@@ -348,6 +371,7 @@ export class ServerRequest extends http.IncomingMessage {
   }
 }
 
+/** Extends http.ServerResponse */
 export class ServerResponse extends http.ServerResponse {
   declare req: ServerRequest
   public router: Router
@@ -418,9 +442,7 @@ export class ServerResponse extends http.ServerResponse {
     }
   }
   
-  /**
-   * sets Content-Type and sends response
-   */
+  /** Sets Content-Type acording to data and sends response */
   send (data: string | Buffer | Error | Readable | object = ''): void {
     if (data instanceof Readable)
       return (data.pipe(this, {end: true}), void 0)
@@ -448,6 +470,7 @@ export class ServerResponse extends http.ServerResponse {
       this.end(data, 'utf8')
   }
 
+  /** Send json response */
   json (data: any) {
     this.isJson = true
     if (data instanceof Error)
@@ -455,7 +478,7 @@ export class ServerResponse extends http.ServerResponse {
     this.send(data)
   }
 
-  /** send json response in form { success: false, error: err } */
+  /** Send json response in form { success: false, error: err } */
   jsonError (error: string | number | object | Error, code?: number): void {
     this.isJson = true
     this.statusCode = code || 200
@@ -466,7 +489,7 @@ export class ServerResponse extends http.ServerResponse {
     this.json(typeof error === 'string' ? { success: false, error } : { success: false, ...error })
   }
   
-  /** send json response in form { success: true, ... } */
+  /** Send json response in form { success: true, ... } */
   jsonSuccess (data?: object | string, code?: number): void {
     this.isJson = true
     this.statusCode = code || 200
@@ -475,11 +498,7 @@ export class ServerResponse extends http.ServerResponse {
     this.json(typeof data === 'string' ? { success: true, message: data } : { success: true, ...data })
   }
 
-  /**
-    * A function to redirect to a specified URL with an optional status code.
-    * @param {number|string} code - The status code for the redirection, or the URL if no code is provided.
-    * @param {string} url - The URL to redirect to.
-    */
+  /** Send redirect response to specified URL with optional status code (default: 302) */
   redirect (code: number | string, url?: string): void {
     if (typeof code === 'string') {
       url = code
@@ -492,6 +511,7 @@ export class ServerResponse extends http.ServerResponse {
   }
 }
 
+/** WebSocket options */
 export interface WebSocketOptions {
   maxPayload?: number,
   autoPong?: boolean,
@@ -500,6 +520,7 @@ export interface WebSocketOptions {
   deflate?: boolean
 } 
 
+/** WebSocket frame object */
 interface WebSocketFrame {
   fin: boolean,
   rsv1: boolean,
@@ -513,18 +534,19 @@ interface WebSocketFrame {
 const EMPTY_BUFFER = Buffer.alloc(0)
 const DEFLATE_TRAILER = Buffer.from([0x00, 0x00, 0xff, 0xff])
 
+/** WebSocket class */
 export class WebSocket extends EventEmitter{
-  private socket: net.Socket
-  private frame?: WebSocketFrame
-  private buffers: Buffer[] = [EMPTY_BUFFER]
-  private buffersLength: number = 0
-  private options: WebSocketOptions
+  private _socket: net.Socket
+  private _frame?: WebSocketFrame
+  private _buffers: Buffer[] = [EMPTY_BUFFER]
+  private _buffersLength: number = 0
+  private _options: WebSocketOptions
   public ready: boolean = false
 
   constructor (req: ServerRequest, options?: WebSocketOptions) {
     super()
-    this.socket = req.socket
-    this.options = {
+    this._socket = req.socket
+    this._options = {
       maxPayload: 1024 * 1024,
       permessageDeflate: false,
       maxWindowBits: 15,
@@ -540,12 +562,12 @@ export class WebSocket extends EventEmitter{
       this._abort('Invalid WebSocket request', 400)
       return
     }
-    if (this.options.permessageDeflate && extensions?.includes('permessage-deflate')) {
+    if (this._options.permessageDeflate && extensions?.includes('permessage-deflate')) {
       let header = 'Sec-WebSocket-Extensions: permessage-deflate'
-      if ((this.options.maxWindowBits || 15) < 15 && extensions.includes('client_max_window_bits'))
-        header += `; client_max_window_bits=${this.options.maxWindowBits}`
+      if ((this._options.maxWindowBits || 15) < 15 && extensions.includes('client_max_window_bits'))
+        header += `; client_max_window_bits=${this._options.maxWindowBits}`
       headers.push(header)
-      this.options.deflate = true
+      this._options.deflate = true
     }
     this.ready = true
     this._upgrade(key, headers)
@@ -565,13 +587,14 @@ export class WebSocket extends EventEmitter{
       '',
       ''
     ];
-    this.socket.write(headers.join('\r\n'))
-    this.socket.on('error',this._errorHandler.bind(this))
-    this.socket.on('data', this._dataHandler.bind(this))
-    this.socket.on('close', () => this.emit('close'))
-    this.socket.on('end', () => this.emit('end'))
+    this._socket.write(headers.join('\r\n'))
+    this._socket.on('error',this._errorHandler.bind(this))
+    this._socket.on('data', this._dataHandler.bind(this))
+    this._socket.on('close', () => this.emit('close'))
+    this._socket.on('end', () => this.emit('end'))
   }
 
+  /** Close connection */
   close (reason?: number, data?: Buffer): void {
     if (reason !== undefined) {
       const buffer: Buffer = Buffer.alloc(2 + (data ? data.length : 0))
@@ -580,10 +603,11 @@ export class WebSocket extends EventEmitter{
         data.copy(buffer, 2)
       data = buffer
     }
-    return this._sendFrame(0x88, data || EMPTY_BUFFER, () => this.socket.destroy())
+    return this._sendFrame(0x88, data || EMPTY_BUFFER, () => this._socket.destroy())
   }
 
-  static getFrame(data: number | string | Buffer | undefined, options?: any) {
+  /** Generate WebSocket frame from data */
+  static getFrame(data: number | string | Buffer | undefined, options?: any): Buffer {
     let msgType: number = 8
     let dataLength: number = 0
     if (typeof data === 'string') {
@@ -621,14 +645,15 @@ export class WebSocket extends EventEmitter{
     return frame
   }
 
+  /** Send data */
   send (data: string | Buffer): void {
     let msgType: number = typeof data === 'string' ? 1 : 2
     if (typeof data === 'string')
       data = Buffer.from(data, 'utf8')
-    if (this.options.deflate && data.length > 256) {
+    if (this._options.deflate && data.length > 256) {
       const output: Buffer[] = []
       const deflate: zlib.Deflate = zlib.createDeflateRaw({
-        windowBits: this.options.maxWindowBits
+        windowBits: this._options.maxWindowBits
       });
       deflate.write(data)
       deflate.on('data', (chunk: Buffer) => output.push(chunk))
@@ -646,12 +671,12 @@ export class WebSocket extends EventEmitter{
     if (this.ready)
       this.close(error instanceof WebSocketError && error.statusCode || 1002)
     else
-      this.socket.destroy()
+      this._socket.destroy()
     this.ready = false
   }
 
   private _headerLength (buffer?: Buffer): number {
-    if (this.frame)
+    if (this._frame)
       return 0
     if (!buffer || buffer.length < 2)
       return 2
@@ -661,33 +686,33 @@ export class WebSocket extends EventEmitter{
 
   private _dataHandler (data: Buffer): void {
     while (data.length) {
-      let frame: WebSocketFrame | undefined = this.frame
+      let frame: WebSocketFrame | undefined = this._frame
       if (!frame) {
-        let lastBuffer: Buffer = this.buffers[this.buffers.length - 1]
-        this.buffers[this.buffers.length - 1] = lastBuffer = Buffer.concat([lastBuffer, data])
+        let lastBuffer: Buffer = this._buffers[this._buffers.length - 1]
+        this._buffers[this._buffers.length - 1] = lastBuffer = Buffer.concat([lastBuffer, data])
         let headerLength: number = this._headerLength(lastBuffer)
         if (lastBuffer.length < headerLength)
           return
         const headerBits: number = lastBuffer[0]
         const lengthBits: number = lastBuffer[1] & 0x7F
-        this.buffers.pop()
+        this._buffers.pop()
         data = lastBuffer.subarray(headerLength)
   
         // parse header
-        frame = this.frame = {
+        frame = this._frame = {
           fin: (headerBits & 0x80) !== 0,
           rsv1: (headerBits & 0x40) !== 0,
           opcode: headerBits & 0x0F,
           mask: (lastBuffer[1] & 0x80) ? lastBuffer.subarray(headerLength - 4, headerLength) : EMPTY_BUFFER,
           length: lengthBits === 126 ? lastBuffer.readUInt16BE(2) : lengthBits === 127 ? lastBuffer.readBigUInt64BE(2) as unknown as number : lengthBits,
           lengthReceived: 0,
-          index: this.buffers.length
+          index: this._buffers.length
         }
       }
       let toRead: number = frame.length - frame.lengthReceived
       if (toRead > data.length)
         toRead = data.length
-      if (this.options.maxPayload && this.options.maxPayload < this.buffersLength + frame.length) {
+      if (this._options.maxPayload && this._options.maxPayload < this._buffersLength + frame.length) {
         this._errorHandler(new WebSocketError('Payload too big', 1009))
         return
       }
@@ -697,15 +722,15 @@ export class WebSocket extends EventEmitter{
         data[i] ^= frame.mask[j & 3]
       frame.lengthReceived += toRead
       if (frame.lengthReceived < frame.length) {
-        this.buffers.push(data)
+        this._buffers.push(data)
         return
       }
-      this.buffers.push(data.subarray(0, toRead))
-      this.buffersLength += toRead
+      this._buffers.push(data.subarray(0, toRead))
+      this._buffersLength += toRead
       data = data.subarray(toRead)
 
       if (frame.opcode >= 8) {
-        const message = Buffer.concat(this.buffers.splice(frame.index))
+        const message = Buffer.concat(this._buffers.splice(frame.index))
         switch (frame.opcode) {
           case 8:
             if (!frame.length)
@@ -717,14 +742,14 @@ export class WebSocket extends EventEmitter{
               else
                 this.emit('close', code, message.subarray(2))
             }
-            this.socket.destroy()
+            this._socket.destroy()
             return
           case 9:
             if (message.length)
               this.emit('ping', message)
             else
               this.emit('ping')
-            if (this.options.autoPong)
+            if (this._options.autoPong)
               this.pong(message)
             break
           case 10:
@@ -740,14 +765,14 @@ export class WebSocket extends EventEmitter{
         if (!frame.opcode)
           return this._errorHandler(new WebSocketError('Invalid WebSocket frame'))
 
-        if (this.options.deflate && frame.rsv1) {
+        if (this._options.deflate && frame.rsv1) {
           const output: Buffer[] = []
           const inflate =  zlib.createInflateRaw({
-            windowBits: this.options.maxWindowBits
+            windowBits: this._options.maxWindowBits
           });
           inflate.on('data', (chunk: Buffer) => output.push(chunk))
           inflate.on('error', (err: Error) => this._errorHandler(err))
-          for (const buffer of this.buffers)
+          for (const buffer of this._buffers)
             inflate.write(buffer)
           inflate.write(DEFLATE_TRAILER)
           inflate.flush(() => {
@@ -757,14 +782,14 @@ export class WebSocket extends EventEmitter{
             }
           })
         } else {
-          const message = Buffer.concat(this.buffers)
+          const message = Buffer.concat(this._buffers)
           this.emit('message', frame.opcode === 1 ? message.toString('utf8') : message)
         }
-        this.buffers = []
-        this.buffersLength = 0
+        this._buffers = []
+        this._buffersLength = 0
       }
-      this.frame = undefined
-      this.buffers.push(EMPTY_BUFFER)
+      this._frame = undefined
+      this._buffers.push(EMPTY_BUFFER)
     }
   }
 
@@ -779,18 +804,20 @@ export class WebSocket extends EventEmitter{
       '',
       message
     ]
-    this.socket.once('finish', () => {
-      this.socket.destroy()
+    this._socket.once('finish', () => {
+      this._socket.destroy()
       this.emit('close')
     })
-    this.socket.end(headers.join('\r\n'))
+    this._socket.end(headers.join('\r\n'))
     this.emit('error', new Error(message))
   }
 
+  /** Send ping frame */
   ping (buffer?: Buffer) {
     this._sendFrame(0x89, buffer || EMPTY_BUFFER)
   }
 
+  /** Send pong frame */
   pong (buffer?: Buffer) {
     this._sendFrame(0x8A, buffer || EMPTY_BUFFER)
   }
@@ -809,9 +836,9 @@ export class WebSocket extends EventEmitter{
       frame.writeUInt16BE(dataLength, 2)
     if (dataLength && frame.length > dataLength) {
       data.copy(frame, headerSize)
-      this.socket.write(frame, cb)
+      this._socket.write(frame, cb)
     } else
-      this.socket.write(frame, () => this.socket.write(data, cb))
+      this._socket.write(frame, () => this._socket.write(data, cb))
   }
 }
 
@@ -819,7 +846,55 @@ const server = {}
 
 /**
  * Controller for dynamic routes
- */
+ * 
+ * @example
+ * ```js
+ * class MyController extends Controller {
+ *   static model = MyModel;
+ *   static acl = 'auth';
+ * 
+ *   static 'acl:index' = '';
+ *   static 'url:index' = 'GET /index';
+ *   async index (req, res) {
+ *     res.send('Hello World')
+ *   }
+ *
+ *   //function name prefixes translated to HTTP methods:
+ *   //  all => GET, get => GET, insert => POST, post => POST,
+ *   //  update => PUT, put => PUT, delete => DELETE,
+ *   //  modify => PATCH, patch => PATCH,
+ *   //  websocket => internal WebSocket
+ *   // automatic acl will be: class_name + '/' + function_name_prefix
+ *   // automatic url will be: method + ' /' + class_name + '/' + function_name_without_prefix
+ *
+ *   //static 'acl:allUsers' = 'MyController/all';
+ *   //static 'url:allUsers' = 'GET /MyController/Users';
+ *   async allUsers () {
+ *     return ['usr1', 'usr2', 'usr3']
+ *   }
+ *
+ *   //static 'acl:getOrder' = 'MyController/get';
+ *   //static 'url:getOrder' = 'GET /Users/:id/:id1';
+ *   static 'group:getOrder' = 'orders';
+ *   static 'model:getOrder' = OrderModel;
+ *   async getOrder (id: string, id1: string) {
+ *     return {id, extras: id1, type: 'order'}
+ *   }
+ *
+ *   //static 'acl:insertOrder' = 'MyController/insert';
+ *   //static 'url:insertOrder' = 'POST /Users/:id';
+ *   static 'model:insertOrder' = OrderModel;
+ *   async insertOrder (id: string, id1: string) {
+ *     return {id, extras: id1, type: 'order'}
+ *   }
+ *
+ *   static 'acl:POST /login' = '';
+ *   async 'POST /login' () {
+ *     return {id, extras: id1, type: 'order'}
+ *   }
+ * }
+ * ```
+*/
 export class Controller {
   protected req: ServerRequest
   protected res: ServerResponse
@@ -951,12 +1026,15 @@ export class Controller {
   }
 }
 
+/** Middleware */
 export interface Middleware {
   (req: ServerRequest, res: ServerResponse, next: Function): any;
+  /** @default 0 */
   priority?: number;
   plugin?: Plugin;
 }
 
+/** Internal router item */
 interface RouterItem {
   name?: string
   hook?: Middleware[]
@@ -966,6 +1044,7 @@ interface RouterItem {
   tree?: {[key: string]: RouterItem}
 }
 
+/** Router */
 export class Router extends EventEmitter {
   public server: MicroServer
   public auth?: Auth
@@ -980,6 +1059,7 @@ export class Router extends EventEmitter {
     this.server = server
   }
 
+  /** Handler */
   handler (req: ServerRequest, res: ServerResponse, next: Function, method?: string) {
     const nextAfter: Function = next
     next = () => this._walkStack(this._stackAfter, req, res, nextAfter)
@@ -1115,6 +1195,7 @@ export class Router extends EventEmitter {
     return this
   }
 
+  /** Clear routes and middlewares */
   clear () {
     this._tree = {}
     this._stack = []
@@ -1274,6 +1355,7 @@ export class Router extends EventEmitter {
     return this
   }
 
+  /** Add hook */
   hook (url: string, ...mid: Middleware[]): Router {
     const m = url.match(/^([A-Z]+) (.*)/)
     let method = '*'
@@ -1293,7 +1375,7 @@ export interface HttpHandler {
 }
 
 export interface TcpHandler {
-  (socket: Socket): void
+  (socket: net.Socket): void
 }
 
 export interface ListenConfig {
@@ -1306,13 +1388,19 @@ export interface ListenConfig {
 }
 
 export interface CorsOptions {
+  /** allowed origins (default: '*') */
   origin: string,
+  /** allowed headers (default: '*') */
   headers: string,
+  /** allow credentials (default: false) */
   credentials: boolean,
+  /** Expose headers */
   expose?: string,
+  /** Max age */
   maxAge?: number
 }
 
+/** MicroServer configuration */
 export interface MicroServerConfig extends ListenConfig {
   /** server instance root path */
   root?: string
@@ -1322,7 +1410,7 @@ export interface MicroServerConfig extends ListenConfig {
   routes?: any
   /** Static file options */
   static?: StaticOptions
-  /** max body size */
+  /** max body size (default: 5MB) */
   maxBodySize?: number
   /** allowed HTTP methods */
   methods?: string
@@ -1330,23 +1418,28 @@ export interface MicroServerConfig extends ListenConfig {
   trustProxy?: string[]
   /** cors options */
   cors?: string | CorsOptions | boolean
-  /** upload dir, default: './upload' */
+  /** upload dir (default: './upload') */
   uploadDir?: string,
-  /** allow websocket deflate compression */
+  /** allow websocket deflate compression (default: false) */
   websocketCompress?: boolean,
-  /** max websocket payload */
+  /** max websocket payload (default: 1MB) */
   websocketMaxPayload?: number,
-  /** websocket max window bits 8-15 for deflate */
+  /** websocket max window bits 8-15 for deflate (default: 10) */
   websocketMaxWindowBits?: number,
   /** extra options for plugins */
   [key: string]: any
 }
 
 export class MicroServer extends EventEmitter {
+  /** server configuration */
   public config: MicroServerConfig
+  /** main router */
   public router: Router
+  /** virtual host routers */
   public vhosts?: {[key: string]: Router}
+  /** all sockets */
   public sockets: Set<net.Socket>
+  /** server instances */
   public servers: Set<net.Server>
 
   private _ready: boolean = false
@@ -1394,9 +1487,7 @@ export class MicroServer extends EventEmitter {
       })
   }
 
-  /**
-   * Add one time listener or call immediatelly for 'ready' 
-   */
+  /** Add one time listener or call immediatelly for 'ready' */
   once (name: string, cb: Function) {
     if (name === 'ready' && this._ready)
       cb()
@@ -1405,9 +1496,7 @@ export class MicroServer extends EventEmitter {
     return this
   }
 
-  /**
-   * Add listener and call immediatelly for 'ready' 
-   */
+  /** Add listener and call immediatelly for 'ready'  */
   on (name: string, cb: Function) {
     if (name === 'ready' && this._ready)
       cb()
@@ -1415,6 +1504,7 @@ export class MicroServer extends EventEmitter {
     return this
   }
 
+  /** Listen server, should be used only if config.listen is not set */
   listen (config?: ListenConfig) {
     const listen = (config?.listen || this.config.listen || 0) + ''
     const handler = config?.handler || this.handler.bind(this)
@@ -1511,7 +1601,7 @@ export class MicroServer extends EventEmitter {
     })
   }
 
-  /** bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User' */
+  /** bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
   bind (fn: string | Function | object): Function {
     if (typeof fn === 'string') {
       let name = fn
@@ -1599,20 +1689,13 @@ export class MicroServer extends EventEmitter {
     return fn.bind(this)
   }
 
-  /**
-   * Add middleware, routes
-   * @return {MicroServer} this instance
-   */
+  /** Add middleware, routes, etc.. see {Router.add} */
   use (...args: any): MicroServer {
     this.router.add(...args)
     return this
   }
 
-  /**
-   * Server handler for http.Server
-   * @param {ServerRequest} req
-   * @param {ServerResponse} res
-   */
+  /** Default server handler */
   handler (req: ServerRequest, res: ServerResponse): void {
     this.requestInit(req, res)
 
@@ -1636,6 +1719,7 @@ export class MicroServer extends EventEmitter {
     }
   }
 
+  /** Preprocess request, used by {MicroServer.handler} */
   handlerInit (req: ServerRequest, res: ServerResponse, next: Function) {
     let cors = this.config.cors
     if (cors && req.headers.origin) {
@@ -1675,7 +1759,7 @@ export class MicroServer extends EventEmitter {
       res.headersOnly = true
     }
 
-    return req.bodyChunkInit(res, () => {
+    return req.bodyDecode(res, this.config, () => {
       if ((req.rawBodySize && req.rawBody[0] && (req.rawBody[0][0] === 91 || req.rawBody[0][0] === 123))
         || req.headers.accept?.includes?.('json') || req.headers['content-type']?.includes?.('json'))
         res.isJson = true
@@ -1684,6 +1768,7 @@ export class MicroServer extends EventEmitter {
     })
   }
 
+  /** Last request handler */
   handlerLast (req: ServerRequest, res: ServerResponse, next?: Function) {
     if (res.headersSent)
       return
@@ -1692,6 +1777,7 @@ export class MicroServer extends EventEmitter {
     return next()
   }
 
+  /** Default upgrade handler, used for WebSockets */
   handlerUpgrade (req: ServerRequest, socket: net.Socket, head: any) {
     this.requestInit(req)
 
@@ -1742,9 +1828,7 @@ export class MicroServer extends EventEmitter {
     router.handler(req, res as unknown as ServerResponse, () => res.error(404), 'WEBSOCKET')
   }
 
-  /**
-   * Close server instance
-   */
+  /** Close server instance */
   async close () {
     return new Promise((resolve: Function) => {
       let count = 0
@@ -1771,43 +1855,50 @@ export class MicroServer extends EventEmitter {
     })
   }
 
+  /** Add route, alias to `server.router.add('GET ' + url, ...args)` */
   get (url: string, ...args: any): MicroServer {
     this.router.add('GET ' + url, ...args)
     return this
   }
 
+  /** Add route, alias to `server.router.add('POST ' + url, ...args)` */
   post (url: string, ...args: any): MicroServer {
     this.router.add('POST ' + url, ...args)
     return this
   }
 
+  /** Add route, alias to `server.router.add('PUT ' + url, ...args)` */
   put (url: string, ...args: any): MicroServer {
     this.router.add('PUT ' + url, ...args)
     return this
   }
 
+  /** Add route, alias to `server.router.add('PATCH ' + url, ...args)` */
   patch (url: string, ...args: any): MicroServer {
     this.router.add('PATCH ' + url, ...args)
     return this
   }
 
+  /** Add route, alias to `server.router.add('DELETE ' + url, ...args)` */
   delete (url: string, ...args: any): MicroServer {
     this.router.add('DELETE ' + url, ...args)
     return this
   }
 
+  /** Add websocket handler, alias to `server.router.add('WEBSOCKET ' + url, ...args)` */
   websocket (url: string, ...args: any): MicroServer {
     this.router.add('WEBSOCKET ' + url, ...args)
     return this
   }
 
+  /** Add router hook, alias to `server.router.hook(url, ...args)` */
   hook (url: string, ...args: any): MicroServer {
     this.router.hook(url, args.filter((o: any) => o))
     return this
   }
 }
 
-/** Local IP middleware plugin */
+/** Trust proxy plugin, adds `req.ip` and `req.localip` */
 class TrustProxyPlugin extends Plugin {
   priority: number = 110
 
@@ -1846,6 +1937,7 @@ interface VHostOptions {
   [host: string]: any[] | {[url: string]: any}
 }
 
+/** Virtual host plugin */
 class VHostPlugin extends Plugin {
   priority: number = 100
 
@@ -1877,6 +1969,7 @@ class VHostPlugin extends Plugin {
 }
 MicroServer.plugins.vhost = VHostPlugin
 
+/** Static files options */
 export interface StaticOptions {
   /** files root directory */
   root?: string,
@@ -1906,6 +1999,7 @@ const etagPrefix = crypto.randomBytes(4).toString('hex')
  * Usage: server.use('static', { root: 'public', path: '/static' })
  */
 class StaticPlugin extends Plugin {
+  /** Default mime types */
   static mimeTypes: { [key: string]: string } = {
     '.ico': 'image/x-icon',
     '.htm': 'text/html',
@@ -1924,13 +2018,21 @@ class StaticPlugin extends Plugin {
     '.ttf': 'application/x-font-ttf'
   }
   
+  /** Custom mime types */
   mimeTypes: { [key: string]: string }
+  /** File extension handlers */
   handlers?: { [key: string]: Middleware }
+  /** Files root directory */
   root: string
+  /** Ignore prefixes */
   ignore: string[]
+  /** Index file. default: 'index.html' */
   index: string
+  /** Update Last-Modified header. default: true */
   lastModified: boolean
+  /** Update ETag header. default: true */
   etag: boolean
+  /** Max file age in seconds (default: 31536000) */
   maxAge?: number
 
   constructor (router: Router, options?: StaticOptions | string) {
@@ -1952,6 +2054,7 @@ class StaticPlugin extends Plugin {
     router.add('GET /' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '') + '/:path*', this.staticHandler.bind(this))
   }
 
+  /** Default static files handler */
   staticHandler (req: ServerRequest, res: ServerResponse, next: Function) {
     if (req.method !== 'GET')
       return next()
@@ -2017,15 +2120,22 @@ class StaticPlugin extends Plugin {
 }
 MicroServer.plugins.static = StaticPlugin
 
+/** Proxy plugin options */
 export interface ProxyPluginOptions {
+  /** Base path */
   path?: string,
+  /** Remote url */
   remote?: string,
+  /** Match regex filter */
   match?: string,
+  /** Override/set headers for remote */
   headers?: { [key: string]: string },
+  /** Valid headers to forward */
   validHeaders?: { [key: string]: boolean }
 }
 
 export class ProxyPlugin extends Plugin {
+  /** Default valid headers */
   static validHeaders: { [key: string]: boolean } = {
     authorization: true,
     accept: true,
@@ -2044,10 +2154,13 @@ export class ProxyPlugin extends Plugin {
     date: true,
     range: true
   }
-
+  /** Current valid headers */
   validHeaders: { [key: string]: boolean }
+  /** Override headers to forward to remote */
   headers: { [key: string]: string } | undefined
+  /** Remote url */
   remoteUrl: URL
+  /** Match regex filter */
   regex?: RegExp
 
   constructor (router: Router, options?: ProxyPluginOptions | string) {
@@ -2068,6 +2181,7 @@ export class ProxyPlugin extends Plugin {
     }
   }
 
+  /** Default proxy handler */
   proxyHandler (req: ServerRequest, res: ServerResponse, next: Function) {
     const reqOptions: http.RequestOptions = {
       method: req.method,
@@ -2122,7 +2236,7 @@ export class ProxyPlugin extends Plugin {
 
     // Content-Length must be allready defined
     if (req.rawBody.length) {
-      const postStream = new stream.Readable()
+      const postStream = new Readable()
       req.rawBody.forEach(chunk => {
         postStream.push(chunk)
       })
@@ -2132,36 +2246,58 @@ export class ProxyPlugin extends Plugin {
       conn.end()
   }
 
+  /** Proxy plugin handler as middleware */
   handler? (req: ServerRequest, res: ServerResponse, next: Function): void {
     return this.proxyHandler(req, res, next)
   }
 }
 MicroServer.plugins.proxy = ProxyPlugin
 
+/** User info */
 export interface UserInfo {
+  /** User id */
   id: string,
+  /** User password plain or hash */
   password?: string,
+  /** ACL options */
   acl?: {[key: string]: boolean},
+  /** User group */
   group?: string,
+  /** Custom user data */
   [key: string]: any
 }
 
+/** Authentication options */
 export interface AuthOptions {
+  /** Authentication token */
   token: string | Buffer
+  /** Users */
   users?: {[key: string]: UserInfo} | ((usr: string, psw?: string) => Promise<UserInfo|undefined>)
+  /** Default ACL */
   defaultAcl?: { [key: string]: boolean }
+  /** Expire time in seconds */
   expire?: number
+  /** Authentication mode */
   mode?: 'cookie' | 'token'
+  /** Authentication realm for basic authentication */
   realm?: string
+  /** Redirect URL */
   redirect?: string
+  /** Authentication cache */
   cache?: { [key: string]: { data: UserInfo, time: number } }
+  /** Interal next cache cleanup time */
   cacheCleanup?: number
 }
 
+/** Authentication class */
 export class Auth {
+  /** Server request */
   public req: ServerRequest | undefined
+  /** Server response */
   public res: ServerResponse | undefined
+  /** Authentication options */
   public options: AuthOptions
+  /** Get user function */
   public users: ((usr: string, psw?: string, salt?: string) => Promise<UserInfo|undefined>)
   
   constructor (options?: AuthOptions) {
@@ -2191,6 +2327,7 @@ export class Auth {
       }
   }
 
+  /** Decode token */
   decode (data: string) {
     data = data.replace(/-/g, '+').replace(/\./g, '/')
     const iv: Buffer = Buffer.from(data.slice(0, 22), 'base64')
@@ -2216,6 +2353,7 @@ export class Auth {
     }
   }
 
+  /** Encode token */
   encode (data: string, expire?: number) {
     if (!expire)
       expire = this.options.expire || defaultExpire
@@ -2236,8 +2374,6 @@ export class Auth {
   acl (id: string, def: boolean = false): boolean {
     if (!this.req?.user)
       return false
-    if (id === 'auth')
-      return true
     const reqAcl: {[key: string]: boolean} | undefined = this.req.user.acl || this.options.defaultAcl
     if (!reqAcl)
       return def
@@ -2245,7 +2381,7 @@ export class Auth {
     // this points to req
     let access: boolean | undefined
     const list = (id || '').split(',')
-    list.forEach(id => access ||= reqAcl[id])
+    list.forEach(id => access ||= id === 'auth' ? true : reqAcl[id])
     if (access !== undefined)
       return access
     list.forEach(id => {
@@ -2262,7 +2398,7 @@ export class Auth {
      * Authenticate user and setup cookie
      * @param {string|UserInfo} usr - user id used with options.users to retrieve user object. User object must contain `id` and `acl` object (Ex. usr = {id:'usr', acl:{'users/*':true}})
      * @param {string} [psw] - user password (if used for user authentication with options.users)
-     * @param {number} [expire] - expire time in seconds (default options.expire)
+     * @param {number} [expire] - expire time in seconds (default: options.expire)
      */
   async token (usr: string | UserInfo | undefined, psw: string | undefined, expire?: number): Promise<string | undefined> {
     let data: string | undefined
@@ -2307,9 +2443,7 @@ export class Auth {
     return usrInfo
   }
 
-  /**
-   * Logout logged in user
-   */
+  /** Logout logged in user */
   logout (): void {
     if (this.req && this.res) {
       const oldToken: string | undefined = (this.req as any).tokenId
@@ -2327,16 +2461,12 @@ export class Auth {
     }
   }
 
-  /**
-   * Get hashed string from user and password
-   */
+  /** Get hashed string from user and password */
   password (usr: string, psw: string, salt?: string): string {
     return Auth.password(usr, psw, salt)
   }
 
-  /**
-   * Get hashed string from user and password
-   */
+  /** Get hashed string from user and password */
   static password (usr: string, psw: string, salt?: string): string {
     if (usr)
       psw = crypto.createHash('sha512').update(usr + '|' + psw).digest('hex')
@@ -2347,16 +2477,12 @@ export class Auth {
     return psw
   }
 
-  /**
-     * Check hash/plain password
-     */
+  /** Validate user password */
   checkPassword (usr: string, psw: string, storedPsw: string, salt?: string): boolean {
     return Auth.checkPassword(usr, psw, storedPsw, salt)
   }
 
-  /**
-   * Check hash/plain password
-   */
+  /** Validate user password */
   static checkPassword (usr: string, psw: string, storedPsw: string, salt?: string): boolean {
     let success: boolean = false
     if (usr && storedPsw) {
@@ -2368,8 +2494,7 @@ export class Auth {
         else // rnd-salted-hash === salted-hash
           success = psw === this.password('', storedPsw, psw)
       } else if (storedPsw.length === 128) { // hash
-        // plain == hash
-        if (psw.length < 128)
+        if (psw.length < 128) // plain == hash
           success =  this.password(usr, psw) === storedPsw
         else if (psw.length === 128) // hash == hash
           success = psw === storedPsw
@@ -2387,9 +2512,7 @@ export class Auth {
     return success
   }
 
-  /**
-   * Clear user cache if users setting where changed
-   */
+  /** Clear user cache if users setting where changed */
   clearCache (): void {
     const cache = this.options.cache
     if (cache)
@@ -2457,6 +2580,7 @@ async function login (username, password, salt) {
 } 
 */
 
+/** Authentication plugin */
 class AuthPlugin extends Plugin {
   options: AuthOptions
 
@@ -2482,6 +2606,7 @@ class AuthPlugin extends Plugin {
     router.auth = new Auth(this.options)
   }
 
+  /** Authentication middleware */
   async handler (req: ServerRequest, res: ServerResponse, next: Function) {
     const options: AuthOptions = this.options, cache = options.cache
     const auth = new Auth(options)
@@ -2566,6 +2691,7 @@ class AuthPlugin extends Plugin {
 }
 MicroServer.plugins.auth = AuthPlugin
 
+/** Create microserver */
 export function create (config: MicroServerConfig) { return new MicroServer(config) }
 
 export interface FileStoreOptions {
@@ -2801,39 +2927,59 @@ function newObjectId() {
   return (new Date().getTime() / 1000 | 0).toString(16) + globalObjectId.toString('hex')
 }
 
+/** Model validation options */
 interface ModelValidateOptions {
-  user?: Object
+  /** User info */
+  user?: UserInfo
+  /** Request params */
   params?: Object
+  /** is insert */
   insert?: boolean
+  /** is read-only */
   readOnly?: boolean
+  /** validate */
   validate?: boolean
+  /** use default */
   default?: boolean
+  /** is required */
   required?: boolean
+  /** projection fields */
   projection?: Document
 }
-
+/** Model field validation options */
 interface ModelValidateFieldOptions extends ModelValidateOptions {
   name: string
   field: FieldDescriptionInternal
   model: Model
 }
 
-export type ModelCallbackFunc = (options: any) => any
+export interface ModelCallbackFunc {
+  (options: any): any
+}
  
-/**
- * Model field description
- */
+/** Model field description */
 export interface FieldDescriptionObject {
+  /** Field type */
   type: string | Function | Model | Array<string | Function | Model>
+  /** Is array */
   array?: boolean
+  /** Is required */
   required?: boolean | string | ModelCallbackFunc
+  /** Can read */
   canRead?: boolean | string | ModelCallbackFunc
+  /** Can write */
   canWrite?: boolean | string | ModelCallbackFunc
+  /** Default value */
   default?: number | string | ModelCallbackFunc
+  /** Validate function */
   validate?: (value: any, options: ModelValidateOptions) => string | number | object | null | Error | typeof Error
+  /** Valid values */
   enum?: Array<string|number>
+  /** Minimum value for string and number */
   minimum?: number | string
+  /** Maximum value for string and number */
   maximum?: number | string
+  /** Regex validation or 'email', 'url', 'date', 'time', 'date-time' */
   format?: string
 }
 
@@ -2857,9 +3003,7 @@ export class Model {
   static collections?: ModelCollections
   static models: {[key: string]: Model} = {}
 
-  /**
-   * Define model
-   */
+  /** Define model */
   static define(name: string, fields: {[key: string]: FieldDescription}, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model {
     options = options || {}
     if (!options.collection && this.collections)
@@ -2871,13 +3015,14 @@ export class Model {
     return inst
   }
 
+  /** Model fields description */
   model: {[key: string]: FieldDescriptionInternal}
+  /** Model name */
   name: string
+  /** Model collection for persistance */
   collection?: MicroCollection | Promise<MicroCollection>
 
-  /**
-   * Create model acording to description
-   */
+  /** Create model acording to description */
   constructor (fields: {[key: string]: FieldDescription}, options?: {collection?: MicroCollection | Promise<MicroCollection>, name?: string}) {
     const model: {[key: string]: FieldDescriptionInternal} = this.model = {}
     this.name = options?.name || (this as any).__proto__.constructor.name
@@ -3058,9 +3203,7 @@ export class Model {
     }
   }
 
-  /**
-   * Validate data over model
-   */
+  /** Validate data over model */
   validate (data: Document, options?: ModelValidateOptions): Document {
     options = options || {}
     const prefix: string = (options as any).name ? (options as any).name + '.' : ''
@@ -3132,9 +3275,7 @@ export class Model {
     return field.validate(value, options) 
   }
 
-  /**
-   * Generate filter for data queries
-   */
+  /** Generate filter for data queries */
   getFilter (data: Document, options?: ModelValidateOptions): Document {
     const res: Document = {}
     if (data._id)
@@ -3159,63 +3300,62 @@ export class Model {
     return res
   }
 
-  /**
-   * Collect data
-   * @param {Object} data - query data
-   * @param {ModelValidateOptions} options
-   * @returns 
-   */
-  async findOne (data: Document, options?: ModelValidateOptions): Promise<Document|undefined> {
+  /** Find one document */
+  async findOne (query: Query, options?: ModelValidateOptions): Promise<Document|undefined> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
-    const doc = await this.collection.findOne(this.getFilter(data, {readOnly: true, ...options}))
+    const doc = await this.collection.findOne(this.getFilter(query, {readOnly: true, ...options}))
     return doc ? this.validate(doc, {readOnly: true}) : undefined
   }
 
-  async findMany (data: Document, options?: ModelValidateOptions): Promise<Document[]> {
+  /** Find many documents */
+  async findMany (query: Query, options?: ModelValidateOptions): Promise<Document[]> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
     const res: Document[] = []
-    await this.collection.find(this.getFilter(data || {}, options)).forEach((doc: Document) => res.push(this.validate(doc, {readOnly: true})))
+    await this.collection.find(this.getFilter(query || {}, options)).forEach((doc: Document) => res.push(this.validate(doc, {readOnly: true})))
     return res
   }
 
+  /** Insert a new document */
   async insert (data: Document, options?: ModelValidateOptions): Promise<void> {
     return this.update(data, {...options, insert: true})
   }
 
-  async update (data: Document, options?: ModelValidateOptions): Promise<void> {
+  /** Update one matching document */
+  async update (query: Query, options?: ModelValidateOptions): Promise<void> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
     if (options?.validate !== false)
-      data = this.validate(data, options)
-    const unset: {[key: string]: number} = {}
-    for (const n in data) {
-      if (data[n] === undefined || data[n] === null) {
-        data.$unset = unset
+      query = this.validate(query, options)
+    const unset: {[key: string]: number} = query.$unset || {}
+    for (const n in query) {
+      if (query[n] === undefined || query[n] === null) {
+        query.$unset = unset
         unset[n] = 1
-        delete data[n]
+        delete query[n]
       }
     }
-    const res = await this.collection.findAndModify({query: this.getFilter(data, {required: true, validate: false, default: false}), update: data, upsert: options?.insert})
+    const res = await this.collection.findAndModify({query: this.getFilter(query, {required: true, validate: false, default: false}), update: query, upsert: options?.insert})
   }
 
-  async delete (data: Document, options?: ModelValidateOptions): Promise<void> {
+  /** Delete one matching document */
+  async delete (query: Query, options?: ModelValidateOptions): Promise<void> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
-    if (data._id)
-      await this.collection.deleteOne(this.getFilter(data, options))
+    if (query._id)
+      await this.collection.deleteOne(this.getFilter(query, options))
   }
 
-  /** Microserver middleware handler */
+  /** Microserver middleware */
   handler (req: ServerRequest, res: ServerResponse): any {
     res.isJson = true
     let filter: Query | undefined, filterStr: string | undefined = req.get.filter
@@ -3250,9 +3390,13 @@ export class Model {
 }
 
 export declare interface MicroCollectionOptions {
+  /** Collection name */
   name?: string
+  /** Collection persistent store */
   store?: FileStore
+  /** Custom data loader */
   load?: (col: MicroCollection) => Promise<object>
+  /** Custom data saver */
   save?: (id: string, doc: Document | undefined, col: MicroCollection) => Promise<Document>
   /** Preloaded data object */
   data?: {[key: string]: Document}
@@ -3266,24 +3410,34 @@ export declare interface Document {
   [key: string]: any
 }
 
+/** Cursor */
 export declare interface Cursor {
   forEach (cb: Function, self?: any): Promise<number>
   all (): Promise<Document[]>
 }
 
+/** Find options */
 export declare interface FindOptions {
+  /** Query */  
   query?: Query
+  /** is upsert */
   upsert?: boolean
+  /** is new */
   new?: boolean
-  update?: object
+  /** update object */
+  update?: Query
+  /** maximum number of hits */
   limit?: number
 }
 
+/** Collection factory */
 class MicroCollections implements ModelCollections {
   protected options: MicroCollectionOptions
   constructor (options: MicroCollectionOptions) {
     this.options = options
   }
+
+  /** Get collection */
   async collection(name: string): Promise<MicroCollection> {
     return new MicroCollection({...this.options, name})
   }
@@ -3291,21 +3445,19 @@ class MicroCollections implements ModelCollections {
 
 /** minimalistic indexed mongo type collection with persistance for usage with Model */
 export class MicroCollection {
+  /** Collection name */
   public name: string
+  /** Collection data */
   public data: {[key: string]: Document}
+
   private _ready: Promise<void> | undefined
   private _save?: (id: string, doc: Document | undefined, col: MicroCollection) => Promise<Document>
 
+  /** Get collections factory */
   static collections(options: MicroCollectionOptions): ModelCollections {
     return new MicroCollections(options)
   }
 
-  /**
-   * @param {string} [options.name] - collection name
-   * @param {FileStore} [options.store] - data store for data persistance
-   * @param {function} [options.load] - data loader
-   * @param {Object} [options.data] - fill with data
-   */
   constructor(options: MicroCollectionOptions = {}) {
     this.name = options.name || this.constructor.name
     const load = options.load ?? (options.store && ((col: MicroCollection) => options.store?.load(col.name, true)))
@@ -3316,14 +3468,16 @@ export class MicroCollection {
     })
   }
 
-  protected async _checkReady() {
+  /** check for collection is ready */
+  protected async checkReady() {
     if (this._ready) {
       await this._ready
       this._ready = undefined
     }
   }
 
-  protected _query(query?: Query, data?: Document) {
+  /** Query document with query filter */
+  protected queryDocument(query?: Query, data?: Document) {
     if (query && data)
       for (const n in query) {
         if (query[n] === null)
@@ -3339,17 +3493,18 @@ export class MicroCollection {
     return data
   }
 
+  /** Count all documents */
   async count(): Promise<number> {
-    await this._checkReady()
+    await this.checkReady()
     return Object.keys(this.data).length
   }
 
   /** Find one matching document */
   async findOne(query: Query): Promise<Document|undefined> {
-    await this._checkReady()
+    await this.checkReady()
     const id: string = query._id
     if (id)
-      return this._query(query, this.data[id])
+      return this.queryDocument(query, this.data[id])
     let res
     await this.find(query).forEach((doc: Document) => (res = doc) && false)
     return res
@@ -3362,7 +3517,7 @@ export class MicroCollection {
         await this._ready
         let count: number = 0
         for (const id in this.data)
-          if (this._query(query, this.data[id])) {
+          if (this.queryDocument(query, this.data[id])) {
             count++
             if (cb.call(self ?? this, this.data[id]) === false)
               break
@@ -3373,20 +3528,21 @@ export class MicroCollection {
       },
       all: async (): Promise<Document[]> => {
         await this._ready
-        return Object.values(this.data).filter(doc => this._query(query, doc))
+        return Object.values(this.data).filter(doc => this.queryDocument(query, doc))
       }
     }
   }
 
+  /** Find and modify one matching document */
   async findAndModify(options: FindOptions): Promise<number> {
     if (!options.query)
       return 0
-    await this._checkReady()
+    await this.checkReady()
     const id = ((options.upsert || options.new) && !options.query._id) ? newObjectId() : options.query._id
     if (!id) {
       let count: number = 0
       this.find(options.query).forEach((doc: Document) => {
-        if (this._query(options.query, doc)) {
+        if (this.queryDocument(options.query, doc)) {
           Object.assign(doc, options.update)
           if (this._save) {
             if (!this._ready)
@@ -3402,23 +3558,33 @@ export class MicroCollection {
       })
       return count
     }
-    const oldData = this._query(options.query, this.data[id])
+    let oldData = this.queryDocument(options.query, this.data[id])
     if (!oldData) {
       if (!options.upsert && !options.new)
         throw new InvalidData(`Document not found`)
-      this.data[id] = {_id: id, ...options.update}
+      oldData = {_id: id}
     } else {
       if (options.new)
         throw new InvalidData(`Document dupplicate`)
-      Object.assign(oldData, options.update)
+    }
+    if (options.update) {
+      for (const n in options.update) {
+        if (!n.startsWith('$'))
+          oldData[n] = options.update[n]
+      }
+      if (options.update.$unset) {
+        for (const n in options.update.$unset)
+          delete oldData[n]
+      }
     }
     if (this._save)
       this.data[id] = await this._save(id, this.data[id], this) || this.data[id]
     return 1
   }
 
+  /** Insert one document */
   async insertOne(doc: Document): Promise<Document> {  
-    await this._checkReady()
+    await this.checkReady()
     if (doc._id && this.data[doc._id])
       throw new InvalidData(`Document ${doc._id} dupplicate`)
     if (!doc._id)
@@ -3431,8 +3597,9 @@ export class MicroCollection {
     return doc
   }
 
+  /** Insert multiple documents */
   async insert(docs: Document[]): Promise<Document[]> {  
-    await this._checkReady()
+    await this.checkReady()
     docs.forEach(doc => {
       if (doc._id && this.data[doc._id])
         throw new InvalidData(`Document ${doc._id} dupplicate`)
@@ -3442,19 +3609,21 @@ export class MicroCollection {
     return docs
   }
 
+  /** Delete one matching document */
   async deleteOne(query: Query): Promise<void> {
     const id = query._id
     if (!id)
       return
-    await this._checkReady()
+    await this.checkReady()
     delete this.data[id]
   }
 
+  /** Delete all matching documents */
   async deleteMany(query: Query): Promise<number> {
     let count: number = 0
-    await this._checkReady()
+    await this.checkReady()
     this.find(query).forEach((doc: Document) => {
-      if (this._query(query, doc)) {
+      if (this.queryDocument(query, doc)) {
         count++
         delete this.data[doc._id]
         if (this._save) {
