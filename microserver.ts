@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.0.1
+ * @version 2.0.2
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -1461,7 +1461,7 @@ export class MicroServer extends EventEmitter {
   private _ready: boolean = false
 
   public static plugins: {[key: string]: PluginClass} = {}
-  public get plugins (): {[key: string]: PluginClass} { return this.router.plugins }
+  public get plugins (): {[key: string]: Plugin} { return this.router.plugins }
   
   private _init: (f: Function, ...args: any[]) => void
   private _methods: {[key: string]: boolean} = {}
@@ -2232,8 +2232,7 @@ export class ProxyPlugin extends Plugin {
     }
     if (this.headers)
       Object.assign(reqOptions.headers, this.headers)
-    if (!reqOptions.headers.Host && !reqOptions.headers.host)
-      (reqOptions.headers as any).Host = reqOptions.host
+    reqOptions.setHost = true
 
     const conn = this.remoteUrl.protocol === 'https:' ? https.request(reqOptions) : http.request(reqOptions)
     conn.on('response', (response: http.IncomingMessage) => {
