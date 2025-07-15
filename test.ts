@@ -1,6 +1,6 @@
 import assert from 'assert'
 import fs from 'fs/promises'
-import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse } from './microserver.ts'
+import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin } from './microserver.ts'
 
 const test: {
   (name: string, fn?: Function): void
@@ -220,7 +220,46 @@ test('Routes: path', async () => {
   })
 })
 
+test('Middleware', async () => {
+  test('priority 1', async() => {
+    server.router.clear()
+    const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
+      res.send('mid1')
+    }
+    const mid2 = (req: ServerRequest, res: ServerResponse, next: Function) => {
+      res.send('mid2')
+    }
+    server.use(mid1)
+    server.use(mid2)
+    assert.equal(await GET('/test'), 'mid1') 
+  })
+  test('priority 2', async() => {
+    server.router.clear()
+    const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
+      res.send('mid1')
+    }
+    mid1.priority = 1
+    const mid2 = (req: ServerRequest, res: ServerResponse, next: Function) => {
+      res.send('mid2')
+    }
+    mid2.priority = 2
+    server.use(mid1)
+    server.use(mid2)
+    assert.equal(await GET('/test'), 'mid2') 
+  })
+  test('plugin', async() => {
+    server.router.clear()
+    class TestPlugin extends Plugin {
+      name: string = 'test'      
+    }
+    server.use(TestPlugin)
+    assert(server.plugins.test)
+    assert.throws(() => server.use(new TestPlugin(server.router)))
+  })
+})
+
 test('Controller', async () => {
+  server.router.clear()
   class TestController extends Controller {
     async insert(id: string) {
       return {data: {id}}
@@ -323,8 +362,8 @@ test('Model', async () => {
   test('field12 type', () => assert.equal(model.model.field12.type, 'string[]'))
   test('field13 type', () => assert.equal(model.model.field13.type, 'model[]'))
   test('field14 type', () => assert.equal(model.model.field14.type, 'string[]'))
-  test('doc1', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {insert: true, user: {name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: new Date('2020-01-01'), field7: 'any', field8: 'test'}))
-  test('doc2', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {readOnly: true, user: {name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test', field2: 'test', field4: 'test', field5: 'test', field6: 'test', field9: 'test'}))
+  test('doc1', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {insert: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: new Date('2020-01-01'), field7: 'any', field8: 'test'}))
+  test('doc2', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {readOnly: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test', field2: 'test', field4: 'test', field5: 'test', field6: 'test', field9: 'test'}))
   test('submodel', () => assert.deepEqual(model.validate({ field2: 'test', field4: null, field10: {name: 'test', value: 'test'} }, {}),{field2: 'test', field4: null, field6: new Date('2020-01-01'), field7: 'any', field10: {name: 'test'}}))
   test('array', () => assert.deepEqual(model.validate({ field2: 'test', field11: [] }, {default: false}),{field2: 'test', field11: []}))
   test('string array', () => assert.deepEqual(model.validate({ field2: 'test', field12: ['123', '456'] }, {default: false}),{field2: 'test', field12: ['123', '456']}))

@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.0.0
+ * @version 2.0.1
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -65,9 +65,14 @@ export class WebSocketError extends Error {
   }
 }
 
+export type Routes = () => {[key: string]: Array<any>} | {[key: string]: Array<any>}
+
 export abstract class Plugin {
+  name?: string
   priority?: number
   handler?(req: ServerRequest, res: ServerResponse, next: Function): void
+  controller?: typeof Controller
+  routes?: () => Routes | Routes 
   constructor(router: Router, ...args: any) { }
 }
 
@@ -1048,6 +1053,7 @@ interface RouterItem {
 export class Router extends EventEmitter {
   public server: MicroServer
   public auth?: Auth
+  public plugins: {[key: string]: Plugin} = {}
 
   private _stack: Middleware[] = []
   private _stackAfter: Middleware[] = []
@@ -1253,33 +1259,30 @@ export class Router extends EventEmitter {
    * @param { {[key: string]: Array<any>} } routes list with subroutes: 'METHOD /suburl': [...middlewares]
    * @return {Router} current router
    */
-  add (...args: any): Router {
+  use (...args: any): Router {
     if (!args[0])
       return this
 
-    // add(plugin)
+    // use(plugin)
     if (args[0] instanceof Plugin)
       return this._plugin(args[0])
 
-    // add(pluginid, ...args)
+    // use(pluginid, ...args)
     if (typeof args[0] === 'string' && MicroServer.plugins[args[0]]) { 
       const constructor = MicroServer.plugins[args[0]]
       const plugin = new constructor(this, ...args.slice(1))
       return this._plugin(plugin)
     }
 
+    // use(PluginClass, ...args)
     if (args[0].prototype instanceof Plugin) {
       const plugin = new args[0](this, ...args.slice(1))
       return this._plugin(plugin)
     }
 
+    // use(middleware)
     if (typeof args[0] === 'function') {
-      class Middleware extends Plugin {
-        priority: number = args[0].priority
-      }
-      const middleware = new Middleware(this)
-      middleware.handler = args[0]
-      return this._plugin(middleware)
+      return this._middleware(args[0] as Middleware)
     }
 
     let method = '*', url = '/'
@@ -1294,14 +1297,14 @@ export class Router extends EventEmitter {
       args = args.slice(1)
     }
 
-    // add('/url', ControllerClass)
+    // use('/url', ControllerClass)
     if (typeof args[0] === 'function' && args[0].prototype instanceof Controller) {
       const routes = args[0].routes()
       if (routes)
         args[0] = routes
     }
 
-    // add('/url', [ ['METHOD /url', ...], {'METHOD } ])
+    // use('/url', [ ['METHOD /url', ...], {'METHOD } ])
     if (Array.isArray(args[0])) {
       if (method !== '*')
         throw new Error('Invalid router usage')
@@ -1310,26 +1313,26 @@ export class Router extends EventEmitter {
           // [methodUrl, ...middlewares]
           if (typeof item[0] !== 'string' || !item[0].match(/^(\w+ )?\//))
             throw new Error('Url expected')
-          return this.add(item[0].replace(/\//, (url === '/' ? '' : url) + '/'), ...item.slice(1))
+          return this.use(item[0].replace(/\//, (url === '/' ? '' : url) + '/'), ...item.slice(1))
         } else
           throw new Error('Invalid param')
       })
       return this
     }
 
-    // add('/url', {'METHOD /url': [...middlewares], ... } ])
+    // use('/url', {'METHOD /url': [...middlewares], ... } ])
     if (typeof args[0] === 'object' && args[0].constructor === Object) {
       if (method !== '*')
         throw new Error('Invalid router usage')
       for (const [subUrl, subArgs] of Object.entries(args[0])) {
         if (!subUrl.match(/^(\w+ )?\//))
           throw new Error('Url expected')
-        this.add(subUrl.replace(/\//, (url === '/' ? '' : url) + '/'), ...(Array.isArray(subArgs) ? subArgs : [subArgs]))    
+        this.use(subUrl.replace(/\//, (url === '/' ? '' : url) + '/'), ...(Array.isArray(subArgs) ? subArgs : [subArgs]))    
       }
       return this
     }
 
-    // add('/url', ...middleware)
+    // use('/url', ...middleware)
     return this._add(method, url, 'next', args.filter((o: any) => o))
   }
 
@@ -1340,18 +1343,31 @@ export class Router extends EventEmitter {
     const stack = priority < -1 ? this._stackAfter : this._stack
 
     const idx = stack.findIndex(f => 'priority' in f
-      && priority > (f.priority || 0))
+      && priority >= (f.priority || 0))
     stack.splice(idx < 0 ? stack.length : idx, 0, middleware)
     return this
   }
 
   private _plugin(plugin: Plugin): Router {
+    if (plugin.name) {
+      if (this.plugins[plugin.name])
+        throw new Error(`Plugin ${plugin.name} already added`)
+      this.plugins[plugin.name] = plugin
+    }
     if (plugin.handler) {
       const middleware: Middleware = plugin.handler.bind(plugin)
       middleware.plugin = plugin
       middleware.priority = plugin.priority
       return this._middleware(middleware)
     }
+    if (plugin.routes) {
+      if (typeof plugin.routes === 'function')
+        this.use(plugin.routes())
+      else  
+        this.use(plugin.routes)
+    }
+    if (plugin.controller)
+      this.use(plugin.controller)
     return this
   }
 
@@ -1445,7 +1461,7 @@ export class MicroServer extends EventEmitter {
   private _ready: boolean = false
 
   public static plugins: {[key: string]: PluginClass} = {}
-  public plugins: {[key: string]: Plugin} = {}
+  public get plugins (): {[key: string]: PluginClass} { return this.router.plugins }
   
   private _init: (f: Function, ...args: any[]) => void
   private _methods: {[key: string]: boolean} = {}
@@ -1475,7 +1491,7 @@ export class MicroServer extends EventEmitter {
 
     for (const key in MicroServer.plugins) {
       if (config[key])
-        this.router.add(MicroServer.plugins[key], config[key])
+        this.router.use(MicroServer.plugins[key], config[key])
     }
 
     if (config.listen)
@@ -1691,7 +1707,7 @@ export class MicroServer extends EventEmitter {
 
   /** Add middleware, routes, etc.. see {Router.add} */
   use (...args: any): MicroServer {
-    this.router.add(...args)
+    this.router.use(...args)
     return this
   }
 
@@ -1857,37 +1873,37 @@ export class MicroServer extends EventEmitter {
 
   /** Add route, alias to `server.router.add('GET ' + url, ...args)` */
   get (url: string, ...args: any): MicroServer {
-    this.router.add('GET ' + url, ...args)
+    this.router.use('GET ' + url, ...args)
     return this
   }
 
   /** Add route, alias to `server.router.add('POST ' + url, ...args)` */
   post (url: string, ...args: any): MicroServer {
-    this.router.add('POST ' + url, ...args)
+    this.router.use('POST ' + url, ...args)
     return this
   }
 
   /** Add route, alias to `server.router.add('PUT ' + url, ...args)` */
   put (url: string, ...args: any): MicroServer {
-    this.router.add('PUT ' + url, ...args)
+    this.router.use('PUT ' + url, ...args)
     return this
   }
 
   /** Add route, alias to `server.router.add('PATCH ' + url, ...args)` */
   patch (url: string, ...args: any): MicroServer {
-    this.router.add('PATCH ' + url, ...args)
+    this.router.use('PATCH ' + url, ...args)
     return this
   }
 
   /** Add route, alias to `server.router.add('DELETE ' + url, ...args)` */
   delete (url: string, ...args: any): MicroServer {
-    this.router.add('DELETE ' + url, ...args)
+    this.router.use('DELETE ' + url, ...args)
     return this
   }
 
   /** Add websocket handler, alias to `server.router.add('WEBSOCKET ' + url, ...args)` */
   websocket (url: string, ...args: any): MicroServer {
-    this.router.add('WEBSOCKET ' + url, ...args)
+    this.router.use('WEBSOCKET ' + url, ...args)
     return this
   }
 
@@ -1901,6 +1917,7 @@ export class MicroServer extends EventEmitter {
 /** Trust proxy plugin, adds `req.ip` and `req.localip` */
 class TrustProxyPlugin extends Plugin {
   priority: number = 110
+  name: string = 'trustProxy'
 
   private trustProxy: string[] = []
 
@@ -1946,14 +1963,15 @@ class VHostPlugin extends Plugin {
 
     const server: MicroServer = router.server
 
-    if (!server.vhosts)
+    if (!server.vhosts) {
       server.vhosts = {}
-    else
+      this.name = 'vhost'
+    } else
       this.handler = undefined
     for (const host in options) {
       if (!server.vhosts[host])
         server.vhosts[host] = new Router(server)
-      server.vhosts[host].add(options[host])
+      server.vhosts[host].use(options[host])
     }
   }
 
@@ -2051,7 +2069,7 @@ class StaticPlugin extends Plugin {
     this.etag = options.etag !== false
     this.maxAge = options.maxAge
 
-    router.add('GET /' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '') + '/:path*', this.staticHandler.bind(this))
+    router.use('GET /' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '') + '/:path*', this.staticHandler.bind(this))
   }
 
   /** Default static files handler */
@@ -2177,7 +2195,7 @@ export class ProxyPlugin extends Plugin {
     this.validHeaders = {...ProxyPlugin.validHeaders, ...options?.validHeaders}
     if (options.path && options.path !== '/') {
       this.handler = undefined
-      router.add(options.path + '/:path*', this.proxyHandler.bind(this))
+      router.use(options.path + '/:path*', this.proxyHandler.bind(this))
     }
   }
 
@@ -2583,6 +2601,7 @@ async function login (username, password, salt) {
 /** Authentication plugin */
 class AuthPlugin extends Plugin {
   options: AuthOptions
+  name: string = 'auth'
 
   constructor (router: Router, options?: AuthOptions) {
     super(router)
@@ -2806,7 +2825,7 @@ export class FileStore {
   }
 
   /** save data */
-  async save (name: string, data: any): Promise<void> {
+  async save (name: string, data: any): Promise<any> {
     this._iter++
     const item: FileItem = {
       atime: new Date().getTime(),
@@ -2814,7 +2833,7 @@ export class FileStore {
       data: data
     }
     this._cache[name] = item
-    return this._sync(async () =>  {
+    this._sync(async () =>  {
       if (this._cache[name] === item) {
         this.cleanup()
         try {
@@ -2823,6 +2842,7 @@ export class FileStore {
         }
       }
     })
+    return data
   }
 
   /** load all files in directory */
@@ -3558,11 +3578,12 @@ export class MicroCollection {
       })
       return count
     }
-    let oldData = this.queryDocument(options.query, this.data[id])
-    if (!oldData) {
+    let doc = this.queryDocument(options.query, this.data[id])
+    if (!doc) {
       if (!options.upsert && !options.new)
         throw new InvalidData(`Document not found`)
-      oldData = {_id: id}
+      doc = {_id: id}
+      this.data[id] = doc
     } else {
       if (options.new)
         throw new InvalidData(`Document dupplicate`)
@@ -3570,15 +3591,15 @@ export class MicroCollection {
     if (options.update) {
       for (const n in options.update) {
         if (!n.startsWith('$'))
-          oldData[n] = options.update[n]
+          doc[n] = options.update[n]
       }
       if (options.update.$unset) {
         for (const n in options.update.$unset)
-          delete oldData[n]
+          delete doc[n]
       }
     }
     if (this._save)
-      this.data[id] = await this._save(id, this.data[id], this) || this.data[id]
+      this.data[id] = await this._save(id, doc, this) || doc
     return 1
   }
 
