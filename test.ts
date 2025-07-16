@@ -135,13 +135,19 @@ test('Static', async () => {
     assert(res.headers['content-length'] > 0)
     assert.equal(await res.text(), '')
   })
+  test('range', async() => {
+    const res = await request('/index.html', { response: true, headers: { range: 'bytes=1-2' }})
+    assert.equal(res.status, 200)
+    assert.equal(res.headers['content-length'], '2')
+    assert.equal(await res.text(), 'ht')
+  })
 })
 
 test('Routes: stack', async () => {
   assert.equal((server.router as any)._stack.length, 0, 'Invalid stack')
   server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
-    if (req.get.test)
-      return {test: req.get.test, body: req.body}
+    if (req.query.test)
+      return {test: req.query.test, body: req.body}
     next()
   })
   test('GET', async() => assert.deepEqual(await GET('/test1?test=test-a'), {success: true, test: 'test-a', body: {}}))
@@ -153,14 +159,14 @@ test('Routes: GET', async () => {
   server.router.clear()
   assert.equal((server.router as any)._tree.GET, undefined, 'Invalid routes')
   server.use('GET /test1', (req: ServerRequest, res: ServerResponse) => {
-    if (req.get.a)
-      return res.jsonSuccess({ a: req.get.a })
-    if (req.get.b)
-      return { b: req.get.b }
-    if (req.get.c)
-      return res.json({ c: req.get.c })
-    if (req.get.d)
-      return Promise.resolve({ d: req.get.d })
+    if (req.query.a)
+      return res.jsonSuccess({ a: req.query.a })
+    if (req.query.b)
+      return { b: req.query.b }
+    if (req.query.c)
+      return res.json({ c: req.query.c })
+    if (req.query.d)
+      return Promise.resolve({ d: req.query.d })
     return 'done'
   })
   test('stack', () => assert.equal((server.router as any)._stack.length, 0))

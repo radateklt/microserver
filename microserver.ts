@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.0.2
+ * @version 2.1.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -13,7 +13,7 @@ import tls from 'tls'
 import querystring from 'querystring'
 import { Readable } from 'stream'
 import fs from 'fs'
-import path from 'path'
+import path, { basename, extname } from 'path'
 import crypto from 'crypto'
 import zlib from 'zlib'
 import { EventEmitter } from 'events'
@@ -71,7 +71,6 @@ export abstract class Plugin {
   name?: string
   priority?: number
   handler?(req: ServerRequest, res: ServerResponse, next: Function): void
-  controller?: typeof Controller
   routes?: () => Routes | Routes 
   constructor(router: Router, ...args: any) { }
 }
@@ -108,8 +107,8 @@ export class ServerRequest extends http.IncomingMessage {
   public baseUrl: string = '/'
   /** Original url */
   public originalUrl?: string
-  /** GET parameters */
-  public get: { [key: string]: string }
+  /** Query parameters */
+  public query: { [key: string]: string }
   /** Router named parameters */
   public params: { [key: string]: string }
   /** Router named parameters list */
@@ -162,8 +161,8 @@ export class ServerRequest extends http.IncomingMessage {
     this.pathname = pathname
     this.path = pathname.slice(pathname.lastIndexOf('/'))
     this.baseUrl = pathname.slice(0, pathname.length - this.path.length)
-    this.get = {}
-    parsedUrl.searchParams.forEach((v, k) => this.get[k] = v)
+    this.query = {}
+    parsedUrl.searchParams.forEach((v, k) => this.query[k] = v)
   }
 
   /** Rewrite request url */
@@ -396,15 +395,16 @@ export class ServerResponse extends http.ServerResponse {
   }
 
   /** Send error reponse */
-  error (error: string | number | Error, text?: string): void {
+  error (error: string | number | Error): void {
     let code: number = 0
+    let text: string
     if (error instanceof Error) {
       if ('statusCode' in error)
         code = error.statusCode as number
       text = error.message
     } else if (typeof error === 'number') {
       code = error
-      text = text || commonCodes[code] || 'Error'
+      text = commonCodes[code] || 'Error'
     } else
       text = error.toString()
     if (!code && text) {
@@ -484,20 +484,18 @@ export class ServerResponse extends http.ServerResponse {
   }
 
   /** Send json response in form { success: false, error: err } */
-  jsonError (error: string | number | object | Error, code?: number): void {
+  jsonError (error: string | number | object | Error): void {
     this.isJson = true
-    this.statusCode = code || 200
     if (typeof error === 'number')
-      [code, error] = [error, http.STATUS_CODES[error] || 'Error']
+      error = http.STATUS_CODES[error] || 'Error'
     if (error instanceof Error)
       return this.json(error)
     this.json(typeof error === 'string' ? { success: false, error } : { success: false, ...error })
   }
   
   /** Send json response in form { success: true, ... } */
-  jsonSuccess (data?: object | string, code?: number): void {
+  jsonSuccess (data?: object | string): void {
     this.isJson = true
-    this.statusCode = code || 200
     if (data instanceof Error)
       return this.json(data)
     this.json(typeof data === 'string' ? { success: true, message: data } : { success: true, ...data })
@@ -513,6 +511,20 @@ export class ServerResponse extends http.ServerResponse {
     this.setHeader('Content-Length', 0)
     this.statusCode = code || 302
     this.end()
+  }
+
+  /** Set status code */
+  status (code: number): this {
+    this.statusCode = code
+    return this    
+  }
+
+  download (path: string, filename?: string): void {
+    StaticPlugin.serveFile(this.req, this, {
+      path: path,
+      filename: filename || basename(path),
+      mimeType: StaticPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
+    })
   }
 }
 
@@ -1366,8 +1378,6 @@ export class Router extends EventEmitter {
       else  
         this.use(plugin.routes)
     }
-    if (plugin.controller)
-      this.use(plugin.controller)
     return this
   }
 
@@ -1705,7 +1715,7 @@ export class MicroServer extends EventEmitter {
     return fn.bind(this)
   }
 
-  /** Add middleware, routes, etc.. see {Router.add} */
+  /** Add middleware, routes, etc.. see {router.use} */
   use (...args: any): MicroServer {
     this.router.use(...args)
     return this
@@ -1871,37 +1881,43 @@ export class MicroServer extends EventEmitter {
     })
   }
 
-  /** Add route, alias to `server.router.add('GET ' + url, ...args)` */
+  /** Add route, alias to `server.router.use(url, ...args)` */
+  all (url: string, ...args: any): MicroServer {
+    this.router.use(url, ...args)
+    return this
+  }
+
+  /** Add route, alias to `server.router.use('GET ' + url, ...args)` */
   get (url: string, ...args: any): MicroServer {
     this.router.use('GET ' + url, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.add('POST ' + url, ...args)` */
+  /** Add route, alias to `server.router.use('POST ' + url, ...args)` */
   post (url: string, ...args: any): MicroServer {
     this.router.use('POST ' + url, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.add('PUT ' + url, ...args)` */
+  /** Add route, alias to `server.router.use('PUT ' + url, ...args)` */
   put (url: string, ...args: any): MicroServer {
     this.router.use('PUT ' + url, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.add('PATCH ' + url, ...args)` */
+  /** Add route, alias to `server.router.use('PATCH ' + url, ...args)` */
   patch (url: string, ...args: any): MicroServer {
     this.router.use('PATCH ' + url, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.add('DELETE ' + url, ...args)` */
+  /** Add route, alias to `server.router.use('DELETE ' + url, ...args)` */
   delete (url: string, ...args: any): MicroServer {
     this.router.use('DELETE ' + url, ...args)
     return this
   }
 
-  /** Add websocket handler, alias to `server.router.add('WEBSOCKET ' + url, ...args)` */
+  /** Add websocket handler, alias to `server.router.use('WEBSOCKET ' + url, ...args)` */
   websocket (url: string, ...args: any): MicroServer {
     this.router.use('WEBSOCKET ' + url, ...args)
     return this
@@ -2009,6 +2025,27 @@ export interface StaticOptions {
   maxAge?: number
 }
 
+export interface ServeFileOptions {
+  /** path */
+  path: string
+  /** root */
+  root?: string
+  /** file name */
+  filename?: string
+  /** file mime type */
+  mimeType?: string
+  /** last modified date */
+  lastModified?: boolean
+  /** etag */
+  etag?: boolean
+  /** max age */
+  maxAge?: number
+  /** range */
+  range?: boolean
+  /** stat */
+  stats?: fs.Stats
+}
+
 const etagPrefix = crypto.randomBytes(4).toString('hex')
 
 /**
@@ -2028,12 +2065,17 @@ class StaticPlugin extends Plugin {
     '.css': 'text/css',
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
-    '.mp3': 'audio/mpeg',
     '.svg': 'image/svg+xml',
+    '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg',
+    '.mp4': 'video/mp4',
     '.pdf': 'application/pdf',
     '.woff': 'application/x-font-woff',
     '.woff2': 'application/x-font-woff2',
-    '.ttf': 'application/x-font-ttf'
+    '.ttf': 'application/x-font-ttf',
+    '.gz': 'application/gzip',
+    '.zip': 'application/zip',
+    '.tgz': 'application/gzip',
   }
   
   /** Custom mime types */
@@ -2060,7 +2102,7 @@ class StaticPlugin extends Plugin {
     if (typeof options === 'string')
       options = { path: options }
 
-    this.mimeTypes = { ...StaticPlugin.mimeTypes, ...options.mimeTypes }
+    this.mimeTypes = options.mimeTypes ? { ...StaticPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticPlugin.mimeTypes)
     this.root = path.resolve((options.root || options?.path || 'public').replace(/^\//, '')) + path.sep
     this.ignore = (options.ignore || []).map((p: string) => path.normalize(path.join(this.root, p)) + path.sep)
     this.index = options.index || 'index.html'
@@ -2081,7 +2123,7 @@ class StaticPlugin extends Plugin {
     if (!filename.startsWith(this.root)) // check root access
       return next()
 
-    const firstch = path.basename(filename)[0]
+    const firstch = basename(filename)[0]
     if (firstch === '.' || firstch === '_') // hidden file
       return next()
 
@@ -2109,31 +2151,65 @@ class StaticPlugin extends Plugin {
         return handler.call(this, req, res, next)
       }
 
-      const etagMatch = req.headers['if-none-match']
-      const etagTime = req.headers['if-modified-since']
-      const etag = '"' + etagPrefix + stats.mtime.getTime().toString(32) + '"'
-
-      res.setHeader('Content-Type', mimeType)
-      if (this.lastModified || req.params.lastModified)
-        res.setHeader('Last-Modified', stats.mtime.toUTCString())
-      if (this.etag || req.params.etag)
-        res.setHeader('Etag', etag)
-      if (this.maxAge || req.params.maxAge)
-        res.setHeader('Cache-Control', 'max-age=' + (this.maxAge || req.params.maxAge))
-
-      if (res.headersOnly) {
-        res.setHeader('Content-Length', stats.size)
-        return res.end()
-      }
-
-      if (etagMatch === etag || etagTime === stats.mtime.toUTCString()) {
-        res.statusCode = 304
-        return res.end()
-      }
-
-      res.setHeader('Content-Length', stats.size)
-      fs.createReadStream(filename).pipe(res)
+      StaticPlugin.serveFile(req, res, {
+        path: filename,
+        mimeType,
+        stats
+      })
     })
+  }
+
+  static serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
+    const filePath: string = options.root ? path.join(options.root, options.path) : options.path
+    const statRes = (err: NodeJS.ErrnoException | null, stats: fs.Stats): void => {
+      if (err)
+        return res.error(err)
+      if (!stats.isFile())
+        return res.error(404)
+
+      if (!res.getHeader('Content-Type')) {
+        if (options.mimeType)
+          res.setHeader('Content-Type', options.mimeType)
+        else
+          res.setHeader('Content-Type', this.mimeTypes[path.extname(options.path)] || 'application/octet-stream')
+      }
+      if (options.filename)
+        res.setHeader('Content-Disposition', 'attachment; filename="' + options.filename + '"')
+      if (options.lastModified !== false)
+        res.setHeader('Last-Modified', stats.mtime.toUTCString())
+      res.setHeader('Content-Length', stats.size)
+      if (options.etag !== false) {
+        const etag = '"' + etagPrefix + stats.mtime.getTime().toString(32) + '"'
+        if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === stats.mtime.toUTCString()) {
+          res.statusCode = 304
+          res.headersOnly = true
+        }
+      }
+      if (options.maxAge)
+        res.setHeader('Cache-Control', 'max-age=' + options.maxAge)
+      if (res.headersOnly) {
+        res.end()
+        return
+      }
+      const streamOptions = {start: 0, end: stats.size - 1}
+      if (options.range !== false) {
+        const range: string | undefined = req.headers['range']
+        if (range && range.startsWith('bytes=')) {
+          const parts = range.slice(6).split('-')
+          
+          streamOptions.start = parseInt(parts[0]) || 0
+          streamOptions.end = parts[1] ? parseInt(parts[1]) : stats.size - 1
+          res.setHeader('Content-Range', `bytes ${streamOptions.start}-${streamOptions.end}/${stats.size}`)
+          res.setHeader('Content-Length', streamOptions.end - streamOptions.start + 1)
+        }        
+      }
+      fs.createReadStream(filePath, streamOptions).pipe(res)
+    }
+
+    if (!options.stats)
+      fs.stat(filePath, statRes)
+    else
+      statRes(null, options.stats)
   }
 }
 MicroServer.plugins.static = StaticPlugin
@@ -2660,7 +2736,7 @@ class AuthPlugin extends Plugin {
       token = sid.slice(sid.indexOf('=') + 1)
 
     if (!token)
-      token = req.get.token
+      token = req.query.token
 
     if (token) {
       const now = new Date().getTime()
@@ -3377,7 +3453,7 @@ export class Model {
   /** Microserver middleware */
   handler (req: ServerRequest, res: ServerResponse): any {
     res.isJson = true
-    let filter: Query | undefined, filterStr: string | undefined = req.get.filter
+    let filter: Query | undefined, filterStr: string | undefined = req.query.filter
     if (filterStr) {
       try {
         if (!filterStr.startsWith('{'))
