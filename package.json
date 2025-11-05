@@ -1,6 +1,6 @@
 {
   "name": "@radatek/microserver",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "HTTP MicroServer",
   "author": "Darius Kisonas",
   "license": "MIT",
@@ -25,6 +25,6 @@
     "publish": "pnpm run build && cp package.json package.json.orig && sed -Ei ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"./dist/microserver.js\",\\n  \"module\": \"./dist/microserver.js\",\\n  \"types\": \"./dist/microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json && pnpm publish --access public --no-git-checks; mv package.json.orig package.json"
   },
   "devDependencies": {
-    "@types/node": "^22.16.4"
+    "@types/node": "^22.19.0"
   }
 }

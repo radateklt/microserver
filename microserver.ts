@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.1.0
+ * @version 2.2.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -24,6 +24,10 @@ const defaultMaxBodySize = 5 * 1024 * 1024
 const defaultMethods = 'HEAD,GET,POST,PUT,PATCH,DELETE'
 
 function NOOP (...args: any[]) { }
+
+function isFunction (fn: any): boolean {
+  return typeof fn === 'function' && !fn.prototype?.constructor;
+}
 
 export class Warning extends Error {
   constructor (text: string) {
@@ -70,8 +74,9 @@ export type Routes = () => {[key: string]: Array<any>} | {[key: string]: Array<a
 export abstract class Plugin {
   name?: string
   priority?: number
-  handler?(req: ServerRequest, res: ServerResponse, next: Function): void
-  routes?: () => Routes | Routes 
+  handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
+  routes?(): Promise<Routes> | Routes 
+  initialise?(): Promise<void> | void
   constructor(router: Router, ...args: any) { }
 }
 
@@ -92,7 +97,7 @@ interface UploadFiles {
 /** Extended http.IncomingMessage */
 export class ServerRequest extends http.IncomingMessage {
   /** Request protocol: http or https */
-  public protocol: string
+  public protocol!: string
   /** Request client IP */
   public ip?: string
   /** Request from local network */
@@ -108,13 +113,13 @@ export class ServerRequest extends http.IncomingMessage {
   /** Original url */
   public originalUrl?: string
   /** Query parameters */
-  public query: { [key: string]: string }
+  public query!: { [key: string]: string }
   /** Router named parameters */
-  public params: { [key: string]: string }
+  public params!: { [key: string]: string }
   /** Router named parameters list */
-  public paramsList: string[]
+  public paramsList!: string[]
   /** Router */
-  public router: Router
+  public router!: Router
   /** Authentication object */
   public auth?: Auth
   /** Authenticated user info */
@@ -126,9 +131,9 @@ export class ServerRequest extends http.IncomingMessage {
 
   private _body?: { [key: string]: any }
   /** Request raw body */
-  public rawBody: Buffer[]
+  public rawBody!: Buffer[]
   /** Request raw body size */
-  public rawBodySize: number
+  public rawBodySize!: number
   
   private constructor (router: Router) {
     super(new net.Socket())
@@ -138,8 +143,9 @@ export class ServerRequest extends http.IncomingMessage {
   private _init (router: Router) {
     Object.assign(this, {
       router,
+      auth: router.auth,
       protocol: 'encrypted' in this.socket && this.socket.encrypted ? 'https' : 'http',
-      get: {},
+      query: {},
       params: {},
       paramsList: [],
       path: '/',
@@ -378,9 +384,9 @@ export class ServerRequest extends http.IncomingMessage {
 /** Extends http.ServerResponse */
 export class ServerResponse extends http.ServerResponse {
   declare req: ServerRequest
-  public router: Router
-  public isJson: boolean
-  public headersOnly: boolean
+  public router!: Router
+  public isJson!: boolean
+  public headersOnly!: boolean
 
   private constructor (router: Router) {
     super(new http.IncomingMessage(new net.Socket()))
@@ -816,7 +822,7 @@ export class WebSocket extends EventEmitter{
     headers = [
       `HTTP/1.1 ${code} ${http.STATUS_CODES[code]}`,
       'Connection: close',
-      'Content-Type: text/html',
+      'Content-Type: ' + message.startsWith('<') ? 'text/html' : 'text/plain',
       `Content-Length: ${Buffer.byteLength(message)}`,
       '',
       message
@@ -1061,6 +1067,56 @@ interface RouterItem {
   tree?: {[key: string]: RouterItem}
 }
 
+class Waiter {
+  private _waiters: any = {}
+  private _id: number = 0
+  private _busy: number = 0
+
+  get busy() {
+    return this._busy > 0
+  }
+
+  startJob() {
+    this._busy++
+  }
+
+  endJob(id?: string) {
+    this._busy--
+    if (!this._busy)
+      this.resolve(id || 'ready')
+  }
+
+  get nextId() {
+    return (++this._id).toString()
+  }
+
+  async wait(id: string): Promise<void> {
+    return new Promise<void>(resolve => (this._waiters[id] = this._waiters[id] || []).push(resolve))
+  }
+
+  resolve(id: string): void {
+    const resolvers = this._waiters[id]
+    if (resolvers)
+      for (const resolve of resolvers)
+        resolve(undefined)
+      delete this._waiters[id]
+  }
+}
+
+class EmitterWaiter extends Waiter {
+  private _emitter: EventEmitter
+  constructor (emitter: EventEmitter) {
+    super()
+    this._emitter = emitter
+  }
+
+  resolve(id: string): void {
+    if (id === 'ready')
+      this._emitter.emit(id)
+    super.resolve(id)
+  }
+}
+
 /** Router */
 export class Router extends EventEmitter {
   public server: MicroServer
@@ -1070,11 +1126,100 @@ export class Router extends EventEmitter {
   private _stack: Middleware[] = []
   private _stackAfter: Middleware[] = []
   private _tree: {[key: string]: RouterItem} = {}
-
+  _waiter: Waiter = new Waiter()
+  
   /** @param {MicroServer} server  */
   constructor (server: MicroServer) {
     super()
     this.server = server
+  }
+
+  /** bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
+  bind (fn: string | Function | object): Function {
+    if (typeof fn === 'string') {
+      let name = fn
+      let idx = name.indexOf(':')
+      if (idx < 0 && name.includes('=')) {
+        name = 'param:' + name
+        idx = 5
+      }
+      if (idx >= 0) {
+        const v = name.slice(idx + 1)
+        const type = name.slice(0, idx)
+
+        // predefined middlewares
+        switch (type) {
+          // redirect:302,https://redirect.to
+          case 'redirect': {
+            let redirect = v.split(','), code = parseInt(v[0])
+            if (!code || code < 301 || code > 399)
+              code = 302
+            return (req: ServerRequest, res: ServerResponse) => res.redirect(code, redirect[1] || v)
+          }
+          // error:422
+          case 'error':
+            return (req: ServerRequest, res: ServerResponse) => res.error(parseInt(v) || 422)
+          // param:name=value
+          case 'param': {
+            idx = v.indexOf('=')
+            if (idx > 0) {
+              const prm = v.slice(0, idx), val = v.slice(idx + 1)
+              return (req: ServerRequest, res: ServerResponse, next: Function) => { req.params[prm] = val; return next() }
+            }
+            break
+          }
+          case 'model': {
+            const model = v
+            return (req: ServerRequest, res: ServerResponse) => {
+              res.isJson = true
+              req.params.model = model
+              req.model = Model.models[model]
+              if (!req.model) {
+                console.error(`Data model ${model} not defined for request ${req.path}`)
+                return res.error(422)
+              }
+              return req.model.handler(req, res)
+            }
+          }
+          // user:userid
+          // group:user_groupid
+          // acl:validacl
+          case 'user':
+          case 'group':
+          case 'acl':
+            return (req: ServerRequest, res: ServerResponse, next: Function) => {
+              if (type === 'user' && v === req.user?.id)
+                return next()
+              if (type === 'acl') {
+                req.params.acl = v
+                if (req.auth?.acl(v))
+                  return next()
+              }
+              if (type === 'group') {
+                req.params.group = v
+                if (req.user?.group === v)
+                  return next()
+              }
+              const accept = req.headers.accept || ''
+              if (!res.isJson && req.auth?.options.redirect && req.method === 'GET' && !accept.includes('json') && (accept.includes('html') || accept.includes('*/*'))) {
+                if (req.auth.options.redirect && req.url !== req.auth.options.redirect)
+                  return res.redirect(302, req.auth.options.redirect)
+                else if (req.auth.options.mode !== 'cookie') {
+                  res.setHeader('WWW-Authenticate', `Basic realm="${req.auth.options.realm}"`)
+                  return res.error(401)
+                }
+              }
+              return res.error('Permission denied')
+            }
+        }
+      }
+      throw new Error('Invalid option: ' + name)
+    }
+    if (fn && typeof fn === 'object' && 'handler' in fn && typeof fn.handler === 'function')
+      return fn.handler.bind(fn)
+    if (typeof fn !== 'function')
+      throw new Error('Invalid middleware: ' + String.toString.call(fn))
+    return fn.bind(this)
   }
 
   /** Handler */
@@ -1175,7 +1320,7 @@ export class Router extends EventEmitter {
         url,
         middlewares
       })
-    middlewares = middlewares.map(i => this.server.bind(i))
+    middlewares = middlewares.map(m => this.bind(m))
 
     let item: RouterItem = this._tree[method]
     if (!item)
@@ -1210,7 +1355,6 @@ export class Router extends EventEmitter {
     if (!item[key])
       item[key] = []
     item[key].push(...middlewares)
-    return this
   }
 
   /** Clear routes and middlewares */
@@ -1226,75 +1370,85 @@ export class Router extends EventEmitter {
    *
    * @signature add(plugin: Plugin)
    * @param {Plugin} plugin plugin module instance
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(pluginid: string, ...args: any)
    * @param {string} pluginid pluginid module
    * @param {...any} args arguments passed to constructor
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(pluginClass: typeof Plugin, ...args: any)
    * @param {typeof Plugin} pluginClass plugin class
    * @param {...any} args arguments passed to constructor
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(middleware: Middleware)
    * @param {Middleware} middleware
-   * @return {Router} current router
+   * @return {Promise<>}
    * 
    * @signature add(methodUrl: string, ...middlewares: any)
    * @param {string} methodUrl 'METHOD /url' or '/url'
    * @param {...any} middlewares
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(methodUrl: string, controllerClass: typeof Controller)
    * @param {string} methodUrl 'METHOD /url' or '/url'
    * @param {typeof Controller} controllerClass
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(methodUrl: string, routes: Array<Array<any>>)
    * @param {string} methodUrl 'METHOD /url' or '/url'
    * @param {Array<Array<any>>} routes list with subroutes: ['METHOD /suburl', ...middlewares]
-   * @return {Router} current router
+   * @return {Promise<>}
    *
    * @signature add(methodUrl: string, routes: Array<Array<any>>)
    * @param {string} methodUrl 'METHOD /url' or '/url'
    * @param {Array<Array<any>>} routes list with subroutes: ['METHOD /suburl', ...middlewares]
-   * @return {Router} current router
+   * @return {Promise<>}
    * 
    * @signature add(routes: { [key: string]: Array<any> })
    * @param { {[key: string]: Array<any>} } routes list with subroutes: 'METHOD /suburl': [...middlewares]
-   * @return {Router} current router
+   * @return {Promise<>}
    * 
    * @signature add(methodUrl: string, routes: { [key: string]: Array<any> })
    * @param {string} methodUrl 'METHOD /url' or '/url'
    * @param { {[key: string]: Array<any>} } routes list with subroutes: 'METHOD /suburl': [...middlewares]
-   * @return {Router} current router
+   * @return {Promise<>}
    */
-  use (...args: any): Router {
+  async use (...args: any): Promise<void> {
     if (!args[0])
-      return this
+      return
+
+    this.server._waiter.startJob()
+
+    for (let i = 0; i < args.length; i++)
+      args[i] = await args[i]
 
     // use(plugin)
-    if (args[0] instanceof Plugin)
-      return this._plugin(args[0])
+    if (args[0] instanceof Plugin) {
+      await this._plugin(args[0])
+      return this.server._waiter.endJob()
+    }
 
     // use(pluginid, ...args)
     if (typeof args[0] === 'string' && MicroServer.plugins[args[0]]) { 
       const constructor = MicroServer.plugins[args[0]]
       const plugin = new constructor(this, ...args.slice(1))
-      return this._plugin(plugin)
+      await this._plugin(plugin)
+      return this.server._waiter.endJob()
     }
 
     // use(PluginClass, ...args)
-    if (args[0].prototype instanceof Plugin) {
+    if (typeof args[0] === 'function' && args[0].prototype instanceof Plugin) {
       const plugin = new args[0](this, ...args.slice(1))
-      return this._plugin(plugin)
+      await this._plugin(plugin)
+      return this.server._waiter.endJob()
     }
 
     // use(middleware)
-    if (typeof args[0] === 'function') {
-      return this._middleware(args[0] as Middleware)
+    if (isFunction(args[0])) {
+      this._middleware(args[0] as Middleware)
+      return this.server._waiter.endJob()
     }
 
     let method = '*', url = '/'
@@ -1311,7 +1465,7 @@ export class Router extends EventEmitter {
 
     // use('/url', ControllerClass)
     if (typeof args[0] === 'function' && args[0].prototype instanceof Controller) {
-      const routes = args[0].routes()
+      const routes = await args[0].routes()
       if (routes)
         args[0] = routes
     }
@@ -1320,16 +1474,16 @@ export class Router extends EventEmitter {
     if (Array.isArray(args[0])) {
       if (method !== '*')
         throw new Error('Invalid router usage')
-      args[0].forEach(item => {
+      for (const item of args[0]) {
         if (Array.isArray(item)) {
           // [methodUrl, ...middlewares]
           if (typeof item[0] !== 'string' || !item[0].match(/^(\w+ )?\//))
             throw new Error('Url expected')
-          return this.use(item[0].replace(/\//, (url === '/' ? '' : url) + '/'), ...item.slice(1))
+          await this.use(item[0].replace(/\//, (url === '/' ? '' : url) + '/'), ...item.slice(1))
         } else
-          throw new Error('Invalid param')
-      })
-      return this
+          throw new Error('Invalid param')        
+      }
+      return this.server._waiter.endJob()
     }
 
     // use('/url', {'METHOD /url': [...middlewares], ... } ])
@@ -1339,55 +1493,61 @@ export class Router extends EventEmitter {
       for (const [subUrl, subArgs] of Object.entries(args[0])) {
         if (!subUrl.match(/^(\w+ )?\//))
           throw new Error('Url expected')
-        this.use(subUrl.replace(/\//, (url === '/' ? '' : url) + '/'), ...(Array.isArray(subArgs) ? subArgs : [subArgs]))    
+        await this.use(subUrl.replace(/\//, (url === '/' ? '' : url) + '/'), ...(Array.isArray(subArgs) ? subArgs : [subArgs]))    
       }
-      return this
+      return this.server._waiter.endJob()
     }
 
     // use('/url', ...middleware)
-    return this._add(method, url, 'next', args.filter((o: any) => o))
+    this._add(method, url, 'next', args.filter((o: any) => o))
+    return this.server._waiter.endJob()
   }
 
-  private _middleware(middleware?: Middleware): Router {
+  private _middleware(middleware?: Middleware): void {
     if (!middleware)
-      return this
+      return
     const priority: number = (middleware?.priority || 0) - 1
     const stack = priority < -1 ? this._stackAfter : this._stack
 
     const idx = stack.findIndex(f => 'priority' in f
       && priority >= (f.priority || 0))
     stack.splice(idx < 0 ? stack.length : idx, 0, middleware)
-    return this
   }
 
-  private _plugin(plugin: Plugin): Router {
+  private async _plugin(plugin: Plugin): Promise<void> {
+    let added: string | undefined
     if (plugin.name) {
       if (this.plugins[plugin.name])
         throw new Error(`Plugin ${plugin.name} already added`)
       this.plugins[plugin.name] = plugin
+      added = plugin.name
     }
+    await plugin.initialise?.()
     if (plugin.handler) {
       const middleware: Middleware = plugin.handler.bind(plugin)
       middleware.plugin = plugin
       middleware.priority = plugin.priority
-      return this._middleware(middleware)
+      this._middleware(middleware)
     }
-    if (plugin.routes) {
-      if (typeof plugin.routes === 'function')
-        this.use(plugin.routes())
-      else  
-        this.use(plugin.routes)
-    }
-    return this
+    if (plugin.routes)
+      await this.use(isFunction(plugin.routes) ? await plugin.routes() : plugin.routes)
+    if (added)
+      this._waiter.resolve(added)
+  }
+
+  async waitPlugin (id: string): Promise<Plugin> {
+    if (!this.plugins[id])
+      await this._waiter.wait(id)
+    return this.plugins[id]
   }
 
   /** Add hook */
-  hook (url: string, ...mid: Middleware[]): Router {
+  hook (url: string, ...mid: Middleware[]): void {
     const m = url.match(/^([A-Z]+) (.*)/)
     let method = '*'
     if (m)
       [method, url] = [m[1], m[2]]
-    return this._add(method, url, 'hook', mid)
+    this._add(method, url, 'hook', mid)
   }
 
   /** Check if middleware allready added */
@@ -1468,13 +1628,12 @@ export class MicroServer extends EventEmitter {
   /** server instances */
   public servers: Set<net.Server>
 
-  private _ready: boolean = false
+  _waiter: Waiter = new EmitterWaiter(this)
 
   public static plugins: {[key: string]: PluginClass} = {}
-  public get plugins (): {[key: string]: Plugin} { return this.router.plugins }
   
-  private _init: (f: Function, ...args: any[]) => void
   private _methods: {[key: string]: boolean} = {}
+  private _init: (f: Function, ...args: any[]) => void
 
   constructor (config: MicroServerConfig) {
     super()
@@ -1515,7 +1674,7 @@ export class MicroServer extends EventEmitter {
 
   /** Add one time listener or call immediatelly for 'ready' */
   once (name: string, cb: Function) {
-    if (name === 'ready' && this._ready)
+    if (name === 'ready' && this.isReady())
       cb()
     else
       super.once(name, cb as any)
@@ -1524,14 +1683,28 @@ export class MicroServer extends EventEmitter {
 
   /** Add listener and call immediatelly for 'ready'  */
   on (name: string, cb: Function) {
-    if (name === 'ready' && this._ready)
+    if (name === 'ready' && this.isReady())
       cb()
     super.on(name, cb as any)
     return this
   }
 
+  public isReady(): boolean {
+    return !this._waiter.busy
+  }
+
+  async waitReady (): Promise<void> {
+    if (this.isReady())
+      return
+    return this._waiter.wait("ready")
+  }
+
+  async waitPlugin (id: string): Promise<void> {
+    await this.router.waitPlugin(id)
+  }
+
   /** Listen server, should be used only if config.listen is not set */
-  listen (config?: ListenConfig) {
+  listen (config?: ListenConfig): Promise<void> {
     const listen = (config?.listen || this.config.listen || 0) + ''
     const handler = config?.handler || this.handler.bind(this)
     const tlsConfig = config ? config.tls : this.config.tls
@@ -1557,168 +1730,64 @@ export class MicroServer extends EventEmitter {
       }
     }
 
-    return new Promise((resolve: Function) => {
-      let readyCount = 0
-      this._ready = false
-      const ready = (srv?: any) => {
-        if (srv)
-          readyCount++
-        if (readyCount >= this.servers.size) {
-          if (!this._ready) {
-            this._ready = true
-            if (this.servers.size === 0)
-              this.close()
-            else
-              this.emit('ready')
-            resolve()
-          }
-        }
+    const reg = /^((?<proto>\w+):\/\/)?(?<host>(\[[^\]]+\]|[a-z][^:,]+|\d+\.\d+\.\d+\.\d+))?:?(?<port>\d+)?/
+    listen.split(',').forEach(listen => {
+      this._waiter.startJob()
+      let {proto, host, port} = reg.exec(listen)?.groups || {}
+      let srv: net.Server | http.Server | https.Server
+      switch (proto) {
+        case 'tcp':
+          if (!config?.handler)
+            throw new Error('Handler is required for tcp')
+          srv = net.createServer(handler as any)
+          break
+        case 'tls':
+          if (!config?.handler)
+            throw new Error('Handler is required for tls')
+          srv = tls.createServer(tlsOptions(), handler as any)
+          tlsOptionsReload(srv as tls.Server)
+          break
+        case 'https':
+          port = port || '443'
+          srv = https.createServer(tlsOptions(), handler as any)
+          tlsOptionsReload(srv as https.Server)
+          break
+        default:
+          port = port || '80'
+          srv = http.createServer(handler as any)
+          break
       }
-      const reg = /^((?<proto>\w+):\/\/)?(?<host>(\[[^\]]+\]|[a-z][^:,]+|\d+\.\d+\.\d+\.\d+))?:?(?<port>\d+)?/
-      listen.split(',').forEach(listen => {
-        let {proto, host, port} = reg.exec(listen)?.groups || {}
-        let srv: net.Server | http.Server | https.Server
-        switch (proto) {
-          case 'tcp':
-            if (!config?.handler)
-              throw new Error('Handler is required for tcp')
-            srv = net.createServer(handler as any)
-            break
-          case 'tls':
-            if (!config?.handler)
-              throw new Error('Handler is required for tls')
-            srv = tls.createServer(tlsOptions(), handler as any)
-            tlsOptionsReload(srv as tls.Server)
-            break
-          case 'https':
-            port = port || '443'
-            srv = https.createServer(tlsOptions(), handler as any)
-            tlsOptionsReload(srv as https.Server)
-            break
-          default:
-            port = port || '80'
-            srv = http.createServer(handler as any)
-            break
-        }
-  
-        this.servers.add(srv)
-        if (port === '0') // skip listening
-          ready(srv)
-        else {
-          srv.listen(parseInt(port), host?.replace(/[\[\]]/g, '') || '0.0.0.0', () => {
-            const addr: net.AddressInfo = srv.address() as net.AddressInfo
-            this.emit('listen', addr.port, addr.address, srv)
-            ready(srv)
-          })
-        }
-        srv.on('error', err => {
-          this.servers.delete(srv)
-          srv.close()
-          ready()
-          this.emit('error', err)
+
+      this.servers.add(srv)
+      if (port === '0') // skip listening
+        this._waiter.endJob()
+      else {
+        srv.listen(parseInt(port), host?.replace(/[\[\]]/g, '') || '0.0.0.0', () => {
+          const addr: net.AddressInfo = srv.address() as net.AddressInfo
+          this.emit('listen', addr.port, addr.address, srv);
+          (srv as any)._ready = true
+          this._waiter.endJob()
         })
-        srv.on('connection', s => {
-          this.sockets.add(s)
-          s.once('close', () => this.sockets.delete(s))
-        })
-        srv.on('upgrade', this.handlerUpgrade.bind(this))
-        ready()
+      }
+      srv.on('error', err => {
+        srv.close()
+        this.servers.delete(srv)
+        if (!(srv as any)._ready)
+          this._waiter.endJob()
+        this.emit('error', err)
       })
+      srv.on('connection', s => {
+        this.sockets.add(s)
+        s.once('close', () => this.sockets.delete(s))
+      })
+      srv.on('upgrade', this.handlerUpgrade.bind(this))
     })
-  }
-
-  /** bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
-  bind (fn: string | Function | object): Function {
-    if (typeof fn === 'string') {
-      let name = fn
-      let idx = name.indexOf(':')
-      if (idx < 0 && name.includes('=')) {
-        name = 'param:' + name
-        idx = 5
-      }
-      if (idx >= 0) {
-        const v = name.slice(idx + 1)
-        const type = name.slice(0, idx)
-
-        // predefined middlewares
-        switch (type) {
-          // redirect:302,https://redirect.to
-          case 'redirect': {
-            let redirect = v.split(','), code = parseInt(v[0])
-            if (!code || code < 301 || code > 399)
-              code = 302
-            return (req: ServerRequest, res: ServerResponse) => res.redirect(code, redirect[1] || v)
-          }
-          // error:422
-          case 'error':
-            return (req: ServerRequest, res: ServerResponse) => res.error(parseInt(v) || 422)
-          // param:name=value
-          case 'param': {
-            idx = v.indexOf('=')
-            if (idx > 0) {
-              const prm = v.slice(0, idx), val = v.slice(idx + 1)
-              return (req: ServerRequest, res: ServerResponse, next: Function) => { req.params[prm] = val; return next() }
-            }
-            break
-          }
-          case 'model': {
-            const model = v
-            return (req: ServerRequest, res: ServerResponse) => {
-              res.isJson = true
-              req.params.model = model
-              req.model = Model.models[model]
-              if (!req.model) {
-                console.error(`Data model ${model} not defined for request ${req.path}`)
-                return res.error(422)
-              }
-              return req.model.handler(req, res)
-            }
-          }
-          // user:userid
-          // group:user_groupid
-          // acl:validacl
-          case 'user':
-          case 'group':
-          case 'acl':
-            return (req: ServerRequest, res: ServerResponse, next: Function) => {
-              if (type === 'user' && v === req.user?.id)
-                return next()
-              if (type === 'acl') {
-                req.params.acl = v
-                if (req.auth?.acl(v))
-                  return next()
-              }
-              if (type === 'group') {
-                req.params.group = v
-                if (req.user?.group === v)
-                  return next()
-              }
-              const accept = req.headers.accept || ''
-              if (!res.isJson && req.auth?.options.redirect && req.method === 'GET' && !accept.includes('json') && (accept.includes('html') || accept.includes('*/*'))) {
-                if (req.auth.options.redirect && req.url !== req.auth.options.redirect)
-                  return res.redirect(302, req.auth.options.redirect)
-                else if (req.auth.options.mode !== 'cookie') {
-                  res.setHeader('WWW-Authenticate', `Basic realm="${req.auth.options.realm}"`)
-                  return res.error(401)
-                }
-              }
-              return res.error('Permission denied')
-            }
-        }
-      }
-      throw new Error('Invalid option: ' + name)
-    }
-    if (fn && typeof fn === 'object' && 'handler' in fn && typeof fn.handler === 'function')
-      return fn.handler.bind(fn)
-    if (typeof fn !== 'function')
-      throw new Error('Invalid middleware: ' + String.toString.call(fn))
-    return fn.bind(this)
+    return this._waiter.wait('ready')
   }
 
   /** Add middleware, routes, etc.. see {router.use} */
-  use (...args: any): MicroServer {
-    this.router.use(...args)
-    return this
+  use (...args: any): Promise<void> {
+    return this.router.use(...args)
   }
 
   /** Default server handler */
@@ -1876,8 +1945,8 @@ export class MicroServer extends EventEmitter {
       }
       this.sockets.clear()
     }).then(() => {
-      this._ready = false
       this.emit('close')
+      this._waiter.resolve("close")
     })
   }
 
@@ -2304,7 +2373,7 @@ export class ProxyPlugin extends Plugin {
     for (let i = 0; i < rawHeaders.length; i += 2) {
       const n = rawHeaders[i], nlow = n.toLowerCase()
       if (this.validHeaders[nlow] && nlow !== 'host')
-        reqOptions.headers[n] = rawHeaders[i + 1]
+        (reqOptions.headers as any)[n] = rawHeaders[i + 1]
     }
     if (this.headers)
       Object.assign(reqOptions.headers, this.headers)

@@ -1,13 +1,14 @@
 import assert from 'assert'
 import fs from 'fs/promises'
 import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin } from './microserver.ts'
+type Routes = import('./microserver.ts').Routes
 
 const test: {
   (name: string, fn?: Function): void
   skip: (name: string, ...args: any) => void
   mode: (mode: 'stop' | 'continue') => void
   run: () => Promise<void>
-} = global.test = (() => {
+} = ((global: any) => {
   let tests: {name: string, fn?: Function}[] = [], _mode: 'stop' | 'skip' | 'continue' = 'continue', _skip: boolean, _run: boolean
   const test = (name: string, fn?: Function) => {
     tests.push({ name, fn })
@@ -39,7 +40,7 @@ const test: {
             lastError = undefined
           } else
             out('32m✔')
-        } catch (e) {
+        } catch (e: any) {
           fail++
           out('31m✘', e.message)
           e.name !== 'AssertionError' && error(e.stack);
@@ -59,8 +60,8 @@ const test: {
       res.length && setTimeout(() => process.exit(1), 1000)
     }
   }
-  return test
-})()
+  return global.test = test
+})(global)
 
 const request: {(url: string, options?: any): Promise<any>; url: string;} = (url: string, options?: any): Promise<any> =>
   fetch(request.url + url, options).then(res => {
@@ -90,14 +91,51 @@ test('Start server', async () => {
     cors: '*',
     listen: parseInt(request.url.match(/:(\d+)/)?.[1] || '80')
   })
+  await server.waitReady()
   let listen = false
   server.on('listen', () => listen = true)
+  await server.waitReady()
   await new Promise((resolve: Function) => server.on('ready', () => resolve()))
   assert(server.servers.size === 1, 'Server not ready')
-  assert((server as any)._ready, 'Ready property not set')
   assert(listen, 'Event listen not fired')
 })
-
+test('Server async use', async () => {
+  let step = 0, done!: Function, failed!: Function, p = new Promise((resolve: Function, reject: Function) => [done, failed] = [resolve, reject])
+  const timeout = (timeout: number) => new Promise((resolve: Function) => setTimeout(() => resolve(), timeout))
+  await server.use((async () => {
+    await timeout(10)
+    if (step === 0)
+      step++
+    else
+      failed(new Error('Failed step 0!=' + step))
+  })())
+  class TestPlugin extends Plugin {
+    name: string = 'TestPlugin'
+    async initialise() {
+      await timeout(4)
+      if (step === 1)
+        step++
+      else
+        failed(new Error('Failed step 1!=' + step))
+    }
+    async routes() {
+      await timeout(2)
+      if (step === 2)
+        step++
+      else
+        failed(new Error('Failed step 2!=' + step))
+      return {} as Routes
+    }    
+  }
+  await server.use(TestPlugin)
+  await server.use((async () => {
+    done()
+    failed = () => {}
+  })())
+  setTimeout(() => failed(new Error('Timeout')), 500)
+  await p
+  assert.equal(step, 3)
+})
 test('CORS', async () => {
   test('OPTIONS', async () => {
     const res = await request('/', { method: 'OPTIONS', response: true} )
@@ -201,33 +239,33 @@ test('Routes: path', async () => {
   server.router.clear()
   assert.equal(router._tree.GET, undefined, 'Invalid routes')
 
-  test('any param', () => {
-    server.use('/test2/:id', () => {})
+  test('any param', async () => {
+    await server.use('/test2/:id', () => {})
     assert(router._tree['*']?.tree?.test2?.param, 'invalid route /test2/:id')
   })
-  test('GET param', () => {
-    server.use('GET /test3/:id', () => {})
+  test('GET param', async () => {
+    await server.use('GET /test3/:id', () => {})
     assert(router._tree.GET?.tree?.test3?.param, 'invalid route /test3/:id')
   })
-  test('GET object', () => {
-    server.use({'GET /test4/p1': () => {}, 'GET /test4/p2': () => {}})
+  test('GET object', async () => {
+    await server.use({'GET /test4/p1': () => {}, 'GET /test4/p2': () => {}})
     assert(router._tree.GET?.tree?.test4?.tree?.p1, 'invalid route /test4/p1')
     assert(router._tree.GET?.tree?.test4?.tree?.p2, 'invalid route /test4/p2')
   })
-  test('GET url object', () => {
-    server.use('/test5', {'GET /p1': () => {}, 'GET /p2': () => {}})
+  test('GET url object', async () => {
+    await server.use('/test5', {'GET /p1': () => {}, 'GET /p2': () => {}})
     assert(router._tree.GET?.tree?.test5?.tree?.p1, 'invalid route /test5/p1')
     assert(router._tree.GET?.tree?.test5?.tree?.p2, 'invalid route /test5/p2')
   })
-  test('GET url array', () => {
-    server.use('/test6', [ ['GET /p1', () => {}], ['GET /p2', () => {}]])
+  test('GET url array', async () => {
+    await server.use('/test6', [ ['GET /p1', () => {}], ['GET /p2', () => {}]])
     assert(router._tree.GET?.tree?.test6?.tree?.p1, 'invalid route /test5/p1')
     assert(router._tree.GET?.tree?.test6?.tree?.p2, 'invalid route /test5/p2')
   })
 })
 
 test('Middleware', async () => {
-  test('priority 1', async() => {
+  test('priority 1', async () => {
     server.router.clear()
     const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
       res.send('mid1')
@@ -235,11 +273,11 @@ test('Middleware', async () => {
     const mid2 = (req: ServerRequest, res: ServerResponse, next: Function) => {
       res.send('mid2')
     }
-    server.use(mid1)
-    server.use(mid2)
+    await server.use(mid1)
+    await server.use(mid2)
     assert.equal(await GET('/test'), 'mid1') 
   })
-  test('priority 2', async() => {
+  test('priority 2', async () => {
     server.router.clear()
     const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
       res.send('mid1')
@@ -249,18 +287,24 @@ test('Middleware', async () => {
       res.send('mid2')
     }
     mid2.priority = 2
-    server.use(mid1)
-    server.use(mid2)
+    await server.use(mid1)
+    await server.use(mid2)
     assert.equal(await GET('/test'), 'mid2') 
   })
-  test('plugin', async() => {
+  test('plugin', async () => {
     server.router.clear()
     class TestPlugin extends Plugin {
       name: string = 'test'      
     }
-    server.use(TestPlugin)
-    assert(server.plugins.test)
-    assert.throws(() => server.use(new TestPlugin(server.router)))
+    await server.use(TestPlugin)
+    assert(server.router.plugins.test)
+    let failed = false
+    try {
+      await server.use(new TestPlugin(server.router))
+    } catch {
+      failed = true
+    }
+    assert(failed)
   })
 })
 
@@ -313,9 +357,9 @@ test('Controller', async () => {
   test('update', () => assert(routes.find(o => o[0] === 'PUT /:id/:id1' && o[1] === 'acl:update')))
   test('get', () => assert(routes.find(o => o[0] === 'GET /:id/:id1' && o[1] === 'acl:get')))
   test('all', () => assert(routes.find(o => o[0] === 'GET /:id' && o[1] === 'acl:all')))
-  test('router', () => {
-    server.use('/api', TestController)
-    server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
+  test('router', async () => {
+    await server.use('/api', TestController)
+    await server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
       req.user = {id: 'test', acl: {get: true, insert: false, update: true, all: false}}
       req.auth = new Auth(req.router?.auth?.options)
       req.auth.req = req
@@ -386,10 +430,10 @@ test('Model invalid', async () => {
     field5: {type: 'int', minimum: 1, maximum: 10},
   }, {name: 'test'})
 
-  async function asserError(fn, check) {
+  async function asserError(fn: () => Promise<any> | any, check: string) {
     try {
       await fn()
-    } catch (e) {
+    } catch (e: any) {
       return assert(e.message.includes(check), e.message)
     }
     assert.fail('Does not throw error')
