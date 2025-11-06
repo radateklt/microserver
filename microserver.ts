@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.2.1
+ * @version 2.2.2
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -972,6 +972,10 @@ export class Controller {
         method = keyMatch[1]
         url = keyMatch[2].startsWith('/') ? keyMatch[2] : ('/' + prefix + keyMatch[2])
       }
+      if (!url && !method) {
+        method = 'GET'
+        url = '/' + prefix + key
+      }
       if (!method)
         return
 
@@ -1143,6 +1147,8 @@ export class Router extends EventEmitter {
         name = 'param:' + name
         idx = 5
       }
+      if (name === 'json')
+        return (req: ServerRequest, res: ServerResponse) => res.isJson = true
       if (idx >= 0) {
         const v = name.slice(idx + 1)
         const type = name.slice(0, idx)
@@ -1994,7 +2000,7 @@ export class MicroServer extends EventEmitter {
 
   /** Add router hook, alias to `server.router.hook(url, ...args)` */
   hook (url: string, ...args: any): MicroServer {
-    this.router.hook(url, args.filter((o: any) => o))
+    this.router.hook(url, ...args.filter((o: any) => o))
     return this
   }
 }
@@ -2583,7 +2589,7 @@ export class Auth {
   async login (usr: string | UserInfo | undefined, psw?: string, options?: {expire?: number, salt?: string}): Promise<UserInfo | undefined> {
     let usrInfo: UserInfo | undefined
     if (typeof usr === 'object')
-      usrInfo =  usr
+      usrInfo = usr
     if (typeof usr === 'string')
       usrInfo = await this.users(usr, psw, options?.salt)
     if (usrInfo?.id || usrInfo?._id) {
@@ -3658,7 +3664,7 @@ export class MicroCollection {
   }
 
   /** Count all documents */
-  async count(): Promise<number> {
+  async countDocuments(): Promise<number> {
     await this.checkReady()
     return Object.keys(this.data).length
   }
@@ -3763,7 +3769,7 @@ export class MicroCollection {
   }
 
   /** Insert multiple documents */
-  async insert(docs: Document[]): Promise<Document[]> {  
+  async insertMany(docs: Document[]): Promise<Document[]> {  
     await this.checkReady()
     docs.forEach(doc => {
       if (doc._id && this.data[doc._id])
@@ -3799,5 +3805,30 @@ export class MicroCollection {
       }
     })
     return count
+  }
+
+  async updateOne(query: Query, doc: Document, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
+    const count = await this.findAndModify({
+      query,
+      update: doc,
+      upsert: options?.upsert,
+      limit: 1
+    })
+    return {
+      upsertedId: undefined,
+      modifiedCount: count
+    }
+  }
+
+  async updateMany(query: Query, update: any, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
+    const count = await this.findAndModify({
+      ...options,
+      query,
+      update
+    })
+    return {
+      upsertedId: undefined,
+      modifiedCount: count
+    }
   }
 }
