@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.0
+ * @version 2.3.1
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -3573,12 +3573,12 @@ export class Model<TSchema extends ModelSchema> {
   }
 
   /** Insert a new document */
-  async insert (data: Record<string, any>, options?: ModelContextOptions): Promise<void> {
+  async insert (data: Record<string, any>, options?: ModelContextOptions): Promise<ModelDocument<TSchema>> {
     return this.update(data, {...options, insert: true})
   }
 
   /** Update one matching document */
-  async update (query: Record<string, any>, options?: ModelContextOptions): Promise<void> {
+  async update (query: Record<string, any>, options?: ModelContextOptions): Promise<ModelDocument<TSchema>> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
@@ -3594,7 +3594,10 @@ export class Model<TSchema extends ModelSchema> {
         delete query[n]
       }
     }
-    const res = await this.collection.findAndModify({query: this.getFilter(query, {required: true, validate: false, default: false}), update: query, upsert: options?.insert})
+    const res = await this.collection.findAndModify({query: this.getFilter(query, {required: true, validate: false, default: false}), update: query, upsert: options?.insert}) as ModelDocument<TSchema>
+    if (!res)
+      throw new NotFound('Document not found')
+    return res
   }
 
   /** Delete one matching document */
@@ -3644,10 +3647,6 @@ export class Model<TSchema extends ModelSchema> {
 export declare interface MicroCollectionOptions<T extends ModelSchema = any> {
   /** Collection name */
   name?: string
-  /** Collection persistent store */
-  store?: FileStore
-  /** Custom data loader */
-  load?: (col: MicroCollection) => Promise<object>
   /** Custom data saver */
   save?: (id: string, doc: ModelDocument<T> | undefined, col: MicroCollection) => Promise<ModelDocument<T>>
   /** Preloaded data object */
@@ -3670,8 +3669,8 @@ export declare interface FindOptions {
   query?: Query
   /** is upsert */
   upsert?: boolean
-  /** is new */
-  new?: boolean
+  /** is upsert */
+  delete?: boolean
   /** update object */
   update?: Query
   /** maximum number of hits */
@@ -3766,58 +3765,25 @@ export class MicroCollection<TSchema extends ModelSchema = any> {
   }
 
   /** Find and modify one matching document */
-  async findAndModify(options: FindOptions): Promise<number> {
-    if (!options.query)
-      return 0
-    const id = ((options.upsert || options.new) && !options.query._id) ? newObjectId() : options.query._id
-    if (!id) {
-      let count: number = 0
-      let promise = Promise.resolve()
-      this.find(options.query).forEach((doc: ModelDocument<TSchema>) => {
-        if (this.queryDocument(options.query, doc)) {
-          Object.assign(doc, options.update)
-          if (this._save) {
-            promise = promise.then(async () => {
-              if (!doc._id)
-                throw new Error('Internal error: missing _id in document')
-              this.data[doc._id] = await this._save?.(doc._id, doc, this) || this.data[doc._id]
-            })
-          }
-          count++
-          if (options.limit && count >= options.limit)
-            return false  
-        }
-      })
-      await promise
-      return count
+  async findAndModify(options: FindOptions): Promise<ModelDocument<TSchema>|undefined> {
+    const res = await this.findOne(options.query || {})
+    if (res?._id) {
+      await this.updateOne({_id: res._id}, options.update || {}, options)
+      return this.data[res._id]
     }
-    let doc = this.queryDocument(options.query, this.data[id])
-    if (!doc) {
-      if (!options.upsert && !options.new)
-        throw new InvalidData(`Document not found`)
-      doc = {_id: id} as ModelDocument<TSchema>
-      this.data[id] = doc
-    } else {
-      if (options.new)
-        throw new InvalidData(`Document dupplicate`)
-    }
-    if (options.update) {
-      for (const n in options.update) {
+    if (options.upsert) {
+      const doc = {...options.query} as ModelDocument<TSchema>
+      for (const n in options.update)
         if (!n.startsWith('$'))
           (doc as any)[n] = options.update[n]
-      }
-      if (options.update.$unset) {
-        for (const n in options.update.$unset)
-          delete doc[n]
-      }
+      if (options.update?.$set)
+        Object.assign(doc, options.update.$set)
+      return this.insertOne(doc)
     }
-    if (this._save)
-      this.data[id] = await this._save(id, doc, this) || doc
-    return 1
   }
 
   /** Insert one document */
-  async insertOne(doc: ModelDocument<TSchema>): Promise<ModelDocument<TSchema>> {  
+  async insertOne(doc: ModelDocument<TSchema>): Promise<ModelDocument<TSchema>> {
     if (doc._id && this.data[doc._id])
       throw new InvalidData(`Document ${doc._id} dupplicate`)
     doc = {...doc}
@@ -3841,53 +3807,82 @@ export class MicroCollection<TSchema extends ModelSchema = any> {
   }
 
   /** Delete one matching document */
-  async deleteOne(query: Query): Promise<void> {
-    const id = query._id
-    if (!id)
-      return
-    delete this.data[id]
+  async deleteOne(query: Query): Promise<number> {
+    return (await this.updateMany(query, {}, {delete: true, limit: 1})).modifiedCount
   }
 
   /** Delete all matching documents */
   async deleteMany(query: Query): Promise<number> {
-    let count: number = 0
+    return (await this.updateMany(query, {}, {delete: true})).modifiedCount
+  }
+
+  async updateOne(query: Query, update: Record<string, any>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
+    const res = await this.updateMany(
+      query,
+      update, 
+      {...options, limit: 1}
+    )
+    return res
+  }
+
+  async updateMany(query: Query, update: Record<string, any>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
+    let res = {upsertedId: undefined, modifiedCount: 0}
+    if (!query)
+      return res
+
     let promise = Promise.resolve()
+    
     this.find(query).forEach((doc: ModelDocument<TSchema>) => {
       if (this.queryDocument(query, doc)) {
-        count++
-        if (!doc._id)
-          return
-        delete this.data[doc._id]
-        if (this._save)
-          promise = promise.then(async () => {doc._id && this._save?.(doc._id, undefined, this)})
+        if (options?.delete) {
+          if (!doc._id)
+            return
+          res.modifiedCount++ 
+          if (this._save)
+            promise = promise.then(async () => {doc._id && this._save?.(doc._id, undefined, this)})
+          delete this.data[doc._id]
+        } else {
+          Object.assign(doc, update)
+          res.modifiedCount++
+          if (this._save) {
+            promise = promise.then(async () => {
+              if (!doc._id)
+                throw new Error('Internal error: missing _id in document')
+              this.data[doc._id] = await this._save?.(doc._id, doc, this) || this.data[doc._id]
+            })
+          }
+        }
+        if (options?.limit && res.modifiedCount >= options?.limit)
+          return false
       }
     })
     await promise
-    return count
-  }
+    if (res.modifiedCount || !options?.upsert || options?.delete)
+      return res
 
-  async updateOne(query: Query, doc: ModelDocument<TSchema>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
-    const count = await this.findAndModify({
-      query,
-      update: doc,
-      upsert: options?.upsert,
-      limit: 1
-    })
-    return {
-      upsertedId: undefined,
-      modifiedCount: count
+    if (!query._id)
+      query._id = (res as any).upsertedId = newObjectId()
+    let doc = this.queryDocument(options.query, this.data[query._id])
+    if (doc)
+      throw new InvalidData(`Document dupplicate`)
+    doc = {_id: query._id, ...query} as ModelDocument<TSchema>
+    this.data[query._id] = doc
+    if (update) {
+      for (const n in update) {
+        if (!n.startsWith('$'))
+          (doc as any)[n] = update[n]
+      }
+      if (update.$set) {
+        for (const n in update.$set)
+          (doc as any)[n] = update.$set[n]
+      }
+      if (update.$unset) {
+        for (const n in update.$unset)
+          delete doc[n]
+      }
     }
-  }
-
-  async updateMany(query: Query, update: any, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
-    const count = await this.findAndModify({
-      ...options,
-      query,
-      update
-    })
-    return {
-      upsertedId: undefined,
-      modifiedCount: count
-    }
+    if (this._save)
+      this.data[query._id] = await this._save(query._id, doc, this) || doc
+    return res 
   }
 }

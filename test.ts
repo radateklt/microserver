@@ -1,7 +1,6 @@
 import assert from 'assert'
 import fs from 'fs/promises'
-import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin } from './microserver.ts'
-import type { ModelSchema } from './microserver.ts'
+import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin, MicroCollectionStore } from './microserver.ts'
 type Routes = import('./microserver.ts').Routes
 
 const test: {
@@ -568,7 +567,7 @@ test('Auth', async () => {
 })
 
 test('Server Auth', async () => {
-  const usersCollection = new MicroCollection({ store: new FileStore({ dir: 'tmp' }), name: 'users' })
+  const usersCollection = await new MicroCollectionStore('tmp').collection('users')
 
   const userProfile = new Model({
     _id: String,
@@ -638,7 +637,7 @@ test('Server Auth', async () => {
     assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsTest)), 'tst4')
   })
   test('Update admin', async () => {
-    assert.deepEqual((await PUT('/admin/user/admin', {name: 'Test'}, optionsAdmin)), {success: true})
+    assert.equal((await PUT('/admin/user/admin', {name: 'Test'}, optionsAdmin))?.success, true)
     assert.equal((await userProfile.findOne({_id: 'admin'}))?.name, 'Test')
     assert.equal((await userProfile.findOne({name: 'Test'}))?._id, 'admin')
   })
@@ -651,7 +650,7 @@ test('Server Auth', async () => {
     assert.equal((await userProfile.findOne({_id: 'admin'}))?.name, 'Test')
   })
   test('Insert admin2', async () => {
-    assert.deepEqual((await POST('/admin/user', {_id: 'admin2', name: 'Admin2'}, optionsAdmin)), {success: true})
+    assert.equal((await POST('/admin/user', {_id: 'admin2', name: 'Admin2'}, optionsAdmin))?.success, true)
     assert.equal((await userProfile.findOne({_id: 'admin2'}))?.name, 'Admin2')
   })
   test('Insert test2', async () => {
