@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.2.2
+ * @version 2.3.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
