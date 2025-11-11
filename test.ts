@@ -1,6 +1,7 @@
 import assert from 'assert'
 import fs from 'fs/promises'
 import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin } from './microserver.ts'
+import type { ModelSchema } from './microserver.ts'
 type Routes = import('./microserver.ts').Routes
 
 const test: {
@@ -18,8 +19,8 @@ const test: {
   test.mode = (mode: 'stop' | 'skip' | 'continue') => _mode = mode
   test.run = async () => {
     if (_run) return
-    _run = true
     const {log, error, warn} = console
+    _run = true
     let count = 0, fail = 0, lastError: Error | undefined 
     const run = async (prefix: string) => {
       for (const {name, fn} of tests) {
@@ -310,7 +311,13 @@ test('Middleware', async () => {
 
 test('Controller', async () => {
   server.router.clear()
-  class TestController extends Controller {
+  const MyModel = new Model({
+    name: 'string',
+    value: 'string',
+  })
+  class TestController extends Controller<typeof MyModel> {
+    static model = MyModel
+
     async insert(id: string) {
       return {data: {id}}
     }
@@ -339,7 +346,8 @@ test('Controller', async () => {
     static 'user:login2' = 'test'
     static 'url:login2' = 'POST /login2'
     async login2() {
-      return {data: this.req.body}
+      //console.log(this.model)
+      return {data: 1 ? this.req.body : {}}
     }
 
     static 'acl:login3' = 'test2'
@@ -378,19 +386,19 @@ test('Controller', async () => {
 test('Model', async () => {
   const subModel = new Model({name: String})
   const model = new Model({
-    _id: 'ObjectId',
+    _id: 'objectid',
     name: String,
     field1: {type: String, format: 'email'},
-    field2: {type: 'String', required: true},
-    field3: {type: 'Number', canRead: false},
-    field4: {type: 'String', default: 'test'},
-    field5: {type: 'String', canWrite: false, default: '${user.name}'},
+    field2: {type: 'string', required: true},
+    field3: {type: 'number', canRead: false},
+    field4: {type: 'string', default: 'test'},
+    field5: {type: 'string', canWrite: false, default: '${user.name}'},
     field6: {type: Date, canWrite: false, default: () => new Date('2020-01-01'), required: true},
     field7: {type: 'any', default: (options) => options.field.type},
     field8: {type: 'any', canWrite:'${user.acl.insert}', canRead:'${user.acl.get}'},
     field9: {type: 'any', canWrite:'${user.acl.update}'},
     field10: {type: subModel},
-    field11: {type: Array},
+    field11: {type: ['any']},
     field12: {type: ['string']},
     field13: {type: [subModel]},
     field14: {type: [String], enum: ['123', '456'] }
@@ -412,19 +420,19 @@ test('Model', async () => {
   test('field12 type', () => assert.equal(model.model.field12.type, 'string[]'))
   test('field13 type', () => assert.equal(model.model.field13.type, 'model[]'))
   test('field14 type', () => assert.equal(model.model.field14.type, 'string[]'))
-  test('doc1', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {insert: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: new Date('2020-01-01'), field7: 'any', field8: 'test'}))
-  test('doc2', () => assert.deepEqual(model.validate({ name: 'test', field1: 'test', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {readOnly: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test', field2: 'test', field4: 'test', field5: 'test', field6: 'test', field9: 'test'}))
-  test('submodel', () => assert.deepEqual(model.validate({ field2: 'test', field4: null, field10: {name: 'test', value: 'test'} }, {}),{field2: 'test', field4: null, field6: new Date('2020-01-01'), field7: 'any', field10: {name: 'test'}}))
-  test('array', () => assert.deepEqual(model.validate({ field2: 'test', field11: [] }, {default: false}),{field2: 'test', field11: []}))
-  test('string array', () => assert.deepEqual(model.validate({ field2: 'test', field12: ['123', '456'] }, {default: false}),{field2: 'test', field12: ['123', '456']}))
-  test('submodel array', () => assert.deepEqual(model.validate({ field2: 'test', field13: [{name: 'test1'}, {value: 'test2'}] }, {default: false}),{field2: 'test', field13: [{name: 'test1'}, {}]}))
+  test('doc1', () => assert.deepEqual(model.document({ name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {insert: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test@example.com', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: new Date('2020-01-01'), field7: 'any', field8: 'test'}))
+  test('doc2', () => assert.deepEqual(model.document({ name: 'test', field1: 'test', field2: 'test', field3: 123, field4: 'test', field5: 'test', field6: 'test', field8: 'test', field9: 'test' }, {readOnly: true, user: {id:'test', name:'test', acl: {insert: true}}}),{name: 'test', field1: 'test', field2: 'test', field4: 'test', field5: 'test', field6: 'test', field9: 'test'}))
+  test('submodel', () => assert.deepEqual(model.document({ field2: 'test', field4: null, field10: {name: 'test', value: 'test'} }, {}),{field2: 'test', field4: null, field6: new Date('2020-01-01'), field7: 'any', field10: {name: 'test'}}))
+  test('array', () => assert.deepEqual(model.document({ field2: 'test', field11: [] }, {default: false}),{field2: 'test', field11: []}))
+  test('string array', () => assert.deepEqual(model.document({ field2: 'test', field12: ['123', '456'] }, {default: false}),{field2: 'test', field12: ['123', '456']}))
+  test('submodel array', () => assert.deepEqual(model.document({ field2: 'test', field13: [{name: 'test1'}, {value: 'test2'}] }, {default: false}),{field2: 'test', field13: [{name: 'test1'}, {}]}))
 })
 
 test('Model invalid', async () => {
   const model = new Model({
-    _id: 'ObjectId',
-    field1: {type: 'Number', required: true, validate: (v: number) => v > 0 && v < 10 ? v : Error},
-    field2: {type: 'String', format: 'email'},
+    _id: 'objectid',
+    field1: {type: 'number', required: true, validate: (v: number) => v > 0 && v < 10 ? v : Error},
+    field2: {type: 'string', format: 'email'},
     field3: {type: Date, canRead: false},
     field4: {type: [String], enum: ['red', 'green']},
     field5: {type: 'int', minimum: 1, maximum: 10},
@@ -438,21 +446,21 @@ test('Model invalid', async () => {
     }
     assert.fail('Does not throw error')
   }
-  test('Null', () => asserError(() => model.validate({field1: null}), 'Invalid field: missing field1'))
-  test('Required', () => asserError(() => model.validate({}), 'Invalid field: missing field1'))
-  test('Number 0', () => asserError(() => model.validate({field1: 0}), 'Invalid field value: field1'))
-  test('Number text', () => asserError(() => model.validate({field1: 'test'}), 'Invalid field type: field1'))
-  test('Email empty', () => asserError(() => model.validate({field1: 1, field2: ''}), 'Invalid field value: field2'))
-  test('Email format', () => asserError(() => model.validate({field1: 1, field2: 'a@#b'}), 'Invalid field value: field2'))
-  test('Date format', () => asserError(() => model.validate({field1: 1, field3: '14.15-16'}), 'Invalid field type: field3'))
-  test('Enum', () => asserError(() => model.validate({field1: 1, field4: ['blue']}), 'Invalid field value: field4'))
-  test('Min', () => asserError(() => model.validate({field1: 1, field5: 0}), 'Invalid field value: field5'))
-  test('Max', () => asserError(() => model.validate({field1: 1, field5: 11}), 'Invalid field value: field5'))
+  test('Null', () => asserError(() => model.document({field1: null}), 'Invalid field: missing field1'))
+  test('Required', () => asserError(() => model.document({}), 'Invalid field: missing field1'))
+  test('Number 0', () => asserError(() => model.document({field1: 0}), 'Invalid field value: field1'))
+  test('Number text', () => asserError(() => model.document({field1: 'test'}), 'Invalid field type: field1'))
+  test('Email empty', () => asserError(() => model.document({field1: 1, field2: ''}), 'Invalid field value: field2'))
+  test('Email format', () => asserError(() => model.document({field1: 1, field2: 'a@#b'}), 'Invalid field value: field2'))
+  test('Date format', () => asserError(() => model.document({field1: 1, field3: '14.15-16'}), 'Invalid field type: field3'))
+  test('Enum', () => asserError(() => model.document({field1: 1, field4: ['blue']}), 'Invalid field value: field4'))
+  test('Min', () => asserError(() => model.document({field1: 1, field5: 0}), 'Invalid field value: field5'))
+  test('Max', () => asserError(() => model.document({field1: 1, field5: 11}), 'Invalid field value: field5'))
 })
 
 test('Model store', async () => {
   server.router.clear()
-  const model = new Model({_id: 'ObjectId', name: String}, {name: 'test', collection: new MicroCollection()})
+  const model = new Model({_id: 'objectid', name: String}, {name: 'test', collection: new MicroCollection()})
   server.get('/test', model)
   server.get('/test/:id', model)
   server.post('/test', model)
@@ -562,13 +570,13 @@ test('Auth', async () => {
 test('Server Auth', async () => {
   const usersCollection = new MicroCollection({ store: new FileStore({ dir: 'tmp' }), name: 'users' })
 
-  const userProfile: Model = new Model({
-    _id: 'string',
+  const userProfile = new Model({
+    _id: String,
     name: { type: 'string', required: true },
     email: { type: 'string', format: 'email' },
     password: { type: 'string', canRead: false },
     group: { type: 'string' },
-    acl: { type: 'object' },
+    acl: { type: 'object' }
   }, { collection: usersCollection, name: 'user' })
 
   const server = new MicroServer({

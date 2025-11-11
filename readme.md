@@ -18,6 +18,7 @@ Features:
   - json file storage with autosave
   - tls with automatic certificate reload
   - data model with validation and mongodb interface
+  - typescript model schema translation
   - simple file/memory storage
   - promises as middleware
   - controller class
@@ -59,10 +60,12 @@ server.use('static', {root:'public'})
 Using data schema:
 
 ```js
-import { MicroServer, Model, MicroCollection, FileStore } from '@radatek/microserver'
+import { MicroServer, Model, MicroCollection } from '@radatek/microserver'
 
-const usersCollection = new MicroCollection({ store: new FileStore({ dir: 'data' }), name: 'users' })
+const db = new MicroCollectionStore('./data')
 // or using MicroDB collection
+//const db = new MicroDB('microdb://data')
+
 const usersCollection = await db.collection('users')
 
 const userProfile = new Model({
@@ -135,5 +138,50 @@ class RestApi extends Controller {
   }
 }
 
+class RestApi extends Controller {
+  static acl = '' // default acl
+
+  gethello(id) {
+    return {message:'Hello ' + id + '!'}
+  }
+
+  async postlogin() {
+    const user = await this.auth.login(this.body.user, this.body.password)
+    return user ? {user} : 403
+  }
+
+  static 'acl:protected' = 'user'
+  static 'url:protected' = 'GET /protected'
+  protected() {
+    return {message:'Protected'}
+  }
+}
+
 server.use('/api', RestApi)
+
+const AddressModel = new Model({
+  street: String,
+  city: String
+})
+
+const UserModel = Model.define({
+  name: { type: String, require: true },
+  address: AddressModel
+})
+
+class UserController extends Controller<typeof UserModel> {
+  static model = UserModel
+
+  static 'acl:get' = 'user/get'
+  get(id: string) {
+    this.model.findOne({id})
+  }
+
+  static 'acl:insert' = 'user/insert'
+  insert() {
+    this.model.insert(this.req.body)
+  }
+}
+
+server.use('/api/user', UserController)
 ```

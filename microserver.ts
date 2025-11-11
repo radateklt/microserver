@@ -69,7 +69,7 @@ export class WebSocketError extends Error {
   }
 }
 
-export type Routes = () => {[key: string]: Array<any>} | {[key: string]: Array<any>}
+export type Routes = () => Record<string, Array<any>> | Array<Array<any>>
 
 export abstract class Plugin {
   name?: string
@@ -94,8 +94,10 @@ interface UploadFiles {
   last?: any
 }
 
+export type ServerRequestBody<T = any> = T extends Model<infer U extends ModelSchema> ? ModelDocument<U> : Record<string, any>
+
 /** Extended http.IncomingMessage */
-export class ServerRequest extends http.IncomingMessage {
+export class ServerRequest<T = any> extends http.IncomingMessage {
   /** Request protocol: http or https */
   public protocol!: string
   /** Request client IP */
@@ -113,9 +115,9 @@ export class ServerRequest extends http.IncomingMessage {
   /** Original url */
   public originalUrl?: string
   /** Query parameters */
-  public query!: { [key: string]: string }
+  public query!: Record<string, string>
   /** Router named parameters */
-  public params!: { [key: string]: string }
+  public params!: Record<string, string>
   /** Router named parameters list */
   public paramsList!: string[]
   /** Router */
@@ -125,11 +127,11 @@ export class ServerRequest extends http.IncomingMessage {
   /** Authenticated user info */
   public user?: UserInfo
   /** Model used for request */
-  public model?: Model
+  public model?: T
   /** Authentication token id */
   public tokenId?: string
 
-  private _body?: { [key: string]: any }
+  private _body?: ServerRequestBody<T>
   /** Request raw body */
   public rawBody!: Buffer[]
   /** Request raw body size */
@@ -180,12 +182,12 @@ export class ServerRequest extends http.IncomingMessage {
   get body () {
     if (!this._body) {
       if (this.method === 'GET')
-        this._body = {}
+        this._body = {} as ServerRequestBody<T>
       else {
         const contentType = this.headers['content-type'] || '',
           charset = contentType.match(/charset=(\S+)/)
         let bodyString = Buffer.concat(this.rawBody).toString((charset ? charset[1] : 'utf8') as BufferEncoding)
-        this._body = {}
+        this._body = {} as ServerRequestBody<T>
         if (bodyString.startsWith('{') || bodyString.startsWith('[')) {
           try {
             this._body = JSON.parse(bodyString)
@@ -193,7 +195,7 @@ export class ServerRequest extends http.IncomingMessage {
             throw new Error('Invalid request format')
           }
         } else if (contentType.startsWith('application/x-www-form-urlencoded')) {
-          this._body = querystring.parse(bodyString)
+          this._body = querystring.parse(bodyString) as ServerRequestBody<T>
         }
       }
     }
@@ -302,8 +304,8 @@ export class ServerRequest extends http.IncomingMessage {
                   stream: {
                     write: (chunk: Buffer) => {
                       if (!this._body)
-                        this._body = {}
-                      this._body[fieldName] = (this._body[fieldName] || '') + chunk.toString()
+                        this._body = {} as ServerRequestBody<T>
+                      (this._body as any)[fieldName] = (this._body[fieldName] || '') + chunk.toString()
                     },
                     close () { }
                   }
@@ -325,7 +327,7 @@ export class ServerRequest extends http.IncomingMessage {
 
       this.pause()
       //res.setHeader('Connection', 'close') // TODO: check if this is needed
-      this._body = {}
+      this._body = {} as ServerRequestBody<T>
       const files = this._files = {
         list: [],
         uploadDir: path.resolve(options.uploadDir || 'upload'),
@@ -382,8 +384,8 @@ export class ServerRequest extends http.IncomingMessage {
 }
 
 /** Extends http.ServerResponse */
-export class ServerResponse extends http.ServerResponse {
-  declare req: ServerRequest
+export class ServerResponse<T = any> extends http.ServerResponse {
+  declare req: ServerRequest<T>
   public router!: Router
   public isJson!: boolean
   public headersOnly!: boolean
@@ -918,12 +920,15 @@ const server = {}
  * }
  * ```
 */
-export class Controller {
-  protected req: ServerRequest
-  protected res: ServerResponse
-  public model?: Model
+export class Controller<T extends Model<any> = any> {
+  protected req: ServerRequest<T>
+  protected res: ServerResponse<T>
 
-  constructor (req: ServerRequest, res: ServerResponse) {
+  get model(): T | undefined {
+    return this.req.model
+  }
+
+  constructor (req: ServerRequest<T>, res: ServerResponse<T>) {
     this.req = req
     this.res = res
     res.isJson = true
@@ -948,7 +953,7 @@ export class Controller {
       let acl = thisStatic['acl:' + key] ?? thisStatic['acl']
       const user = thisStatic['user:' + key] ?? thisStatic['user']
       const group = thisStatic['group:' + key] ?? thisStatic['group']
-      const model = thisStatic['model:' + key] ?? thisStatic['model']
+      const modelName = thisStatic['model:' + key] ?? thisStatic['model']
 
       let method = ''
       if (!url)
@@ -1040,10 +1045,18 @@ export class Controller {
       list.push((req: ServerRequest, res: ServerResponse) => {
         res.isJson = true
         const obj: Controller = new this(req, res)
-        if (model) {
-          req.model = obj.model = model instanceof Model ? model : Model.models[model]
+        if (modelName) {
+          req.model = modelName instanceof Model ? modelName : Model.models[modelName]
           if (!obj.model)
-            throw new InvalidData(model, 'model')
+            throw new InvalidData(modelName, 'model')
+          const modelOptions: Record<string, any> = {...obj.model.options, user: req.user, params: req.params}
+          req.model = new Proxy(req.model, {
+            get: (target: any, prop: string) => {
+              if (prop === 'options')
+                return modelOptions
+              return target[prop]
+            }
+          })
         }
         return func.apply(obj, req.paramsList)
       })
@@ -1068,7 +1081,7 @@ interface RouterItem {
   next?: Middleware[]
   param?: RouterItem
   last?: RouterItem
-  tree?: {[key: string]: RouterItem}
+  tree?: Record<string, RouterItem>
 }
 
 class Waiter {
@@ -1125,11 +1138,11 @@ class EmitterWaiter extends Waiter {
 export class Router extends EventEmitter {
   public server: MicroServer
   public auth?: Auth
-  public plugins: {[key: string]: Plugin} = {}
+  public plugins: Record<string, Plugin> = {}
 
   private _stack: Middleware[] = []
   private _stackAfter: Middleware[] = []
-  private _tree: {[key: string]: RouterItem} = {}
+  private _tree: Record<string, RouterItem> = {}
   _waiter: Waiter = new Waiter()
   
   /** @param {MicroServer} server  */
@@ -2996,10 +3009,10 @@ export class FileStore {
   }
 
   /** load all files in directory */
-  async all (name: string, autosave: boolean = false): Promise<{[key: string]: any}> {
+  async all (name: string, autosave: boolean = false): Promise<Record<string, any>> {
     return this._sync(async () =>  {
       const files = await fs.promises.readdir(name ? path.join(this._dir, name) : this._dir)
-      const res: {[key: string]: any} = {}
+      const res: Record<string, any> = {}
       await Promise.all(files.map(file => 
         (file.startsWith('.') && !file.startsWith('_') && !file.startsWith('$')) &&
           this.load(name ? name + '/' + file : file, autosave)
@@ -3098,7 +3111,7 @@ function newObjectId() {
 }
 
 /** Model validation options */
-interface ModelValidateOptions {
+interface ModelContextOptions {
   /** User info */
   user?: UserInfo
   /** Request params */
@@ -3114,25 +3127,32 @@ interface ModelValidateOptions {
   /** is required */
   required?: boolean
   /** projection fields */
-  projection?: Document
+  projection?: Record<string, 0|1|true|false>
 }
 /** Model field validation options */
-interface ModelValidateFieldOptions extends ModelValidateOptions {
+interface ModelValidateFieldOptions extends ModelContextOptions {
   name: string
-  field: FieldDescriptionInternal
-  model: Model
+  field: ResolvedFieldSchema
+  model: Model<any>
 }
 
 export interface ModelCallbackFunc {
   (options: any): any
 }
- 
+
+type ModelBasicCtorType = typeof String | typeof Number | typeof Boolean | typeof Date // | Object
+type ModelBasicNamedType = 'string' | 'String' | 'number' | 'Number' | 'int' | 'Int' |
+                            'integer' | 'Integer' | 'boolean' | 'Boolean' | 'object' | 'Object' |
+                            'objectid' | 'ObjectId' | 'date' | 'Date' | 'any' | 'Any'
+type ModelBasicType = ModelBasicNamedType | ModelBasicCtorType | Model<any>
+type ModelFieldSimpleType = ModelBasicType | [ModelBasicType] | [ModelBasicType, ...never[]]
+
 /** Model field description */
-export interface FieldDescriptionObject {
+export interface ModelFieldSchema {
   /** Field type */
-  type: string | Function | Model | Array<string | Function | Model>
+  type: ModelFieldSimpleType
   /** Is array */
-  array?: boolean
+  array?: true | false
   /** Is required */
   required?: boolean | string | ModelCallbackFunc
   /** Can read */
@@ -3142,7 +3162,7 @@ export interface FieldDescriptionObject {
   /** Default value */
   default?: number | string | ModelCallbackFunc
   /** Validate function */
-  validate?: (value: any, options: ModelValidateOptions) => string | number | object | null | Error | typeof Error
+  validate?: (value: any, options: ModelContextOptions) => string | number | object | null | Error | typeof Error
   /** Valid values */
   enum?: Array<string|number>
   /** Minimum value for string and number */
@@ -3153,11 +3173,9 @@ export interface FieldDescriptionObject {
   format?: string
 }
 
-type FieldDescription = FieldDescriptionObject | string | Function | Model | FieldDescription[]
-
-interface FieldDescriptionInternal {
+interface ResolvedFieldSchema {
   type: string
-  model?: Model
+  model?: Model<any>
   required?: ModelCallbackFunc
   canRead: ModelCallbackFunc
   canWrite: ModelCallbackFunc
@@ -3165,43 +3183,99 @@ interface FieldDescriptionInternal {
   validate: (value: any, options: ModelValidateFieldOptions) => any
 }
 
+export interface ModelSchema {
+  [K: string]: ModelFieldSchema | ModelFieldSimpleType
+}
+
+type ModelDocumentTypeByName<T> = 
+  T extends 'string' | 'String' ? string :
+  T extends 'number' | 'Number' | 'int' | 'Int' ? number :
+  T extends 'boolean' | 'Boolean' ? boolean :
+  T extends 'date' | 'Date' ? Date :
+  T extends 'objectid' | 'ObjectId' ? string :
+  T extends 'object' | 'Object' ? Record<string, any> :
+  T extends 'any' | 'Any' ? any :
+  never
+
+type ModelDocumentTypeByCtor<T> = 
+  T extends typeof String ? string :
+  T extends typeof Number ? number :
+  T extends typeof Boolean ? boolean :
+  T extends typeof Date ? Date :
+  T extends typeof Object ? Record<string, any> :
+  never
+
+type ModelFieldTypeExtract<T extends ModelFieldSchema> = 
+  T['type'] extends string ? ModelDocumentTypeByName<T['type']> :
+  T['type'] extends Array<infer U> ? Array<ModelDocumentType<U>> :
+  T['type'] extends Function ? ModelDocumentTypeByCtor<T['type']> :
+  T['type'] extends Model<infer U> ? ModelDocument<U> :
+  never
+
+type ModelDocumentType<T> = 
+  T extends string ? ModelDocumentTypeByName<T> :
+  T extends Array<infer U> ? Array<ModelDocumentType<U>> :
+  T extends Function ? ModelDocumentTypeByCtor<T> :
+  T extends ModelFieldSchema ? ModelFieldTypeExtract<T> :
+  T extends Model<infer U> ? ModelDocument<U> :
+  never
+
+
+export interface ModelDocumentField<T extends ModelFieldSchema> {
+  value: T['array'] extends true ? Array<ModelFieldTypeExtract<T>> : ModelFieldTypeExtract<T>
+  required?: T['required']
+  canRead?: T['canRead'] 
+  canWrite?: T['canWrite']
+  default?: T['default']
+  validate?: T['validate']
+}
+
+export type ModelDocument<T extends ModelSchema> = {
+  [K in keyof T]: ModelDocumentType<T[K]>} & {
+  _id?: string
+}
+
 export declare interface ModelCollections {
   collection(name: string): Promise<MicroCollection>
 }
 
-export class Model {
+export class Model<TSchema extends ModelSchema> {
   static collections?: ModelCollections
-  static models: {[key: string]: Model} = {}
+  static models: Record<string, Model<any>> = {}
+
+  static schema(schema: ModelSchema): ModelSchema {
+    return schema
+  }
 
   /** Define model */
-  static define(name: string, fields: {[key: string]: FieldDescription}, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model {
+  static define<T extends ModelSchema>(name: string, schema: T, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model<T> {
     options = options || {}
     if (!options.collection && this.collections)
       options.collection = this.collections.collection(name)
-    const inst: Model = options?.class
-      ? new options.class(fields, {name, ...options})
-      : new Model(fields, {name, ...options})
+    const inst: Model<T> = options?.class
+      ? new options.class(schema, {name, ...options})
+      : new Model(schema, {name, ...options})
     Model.models[name] = inst
     return inst
   }
 
   /** Model fields description */
-  model: {[key: string]: FieldDescriptionInternal}
-  /** Model name */
-  name: string
+  model: Record<string, ResolvedFieldSchema>
   /** Model collection for persistance */
   collection?: MicroCollection | Promise<MicroCollection>
+  /** Custom options */
+  options: Record<string, any> = {}
 
   /** Create model acording to description */
-  constructor (fields: {[key: string]: FieldDescription}, options?: {collection?: MicroCollection | Promise<MicroCollection>, name?: string}) {
-    const model: {[key: string]: FieldDescriptionInternal} = this.model = {}
-    this.name = options?.name || (this as any).__proto__.constructor.name
+  constructor (schema: TSchema, options?: {collection?: MicroCollection | Promise<MicroCollection>, name?: string}) {
+    const model: Record<string, ResolvedFieldSchema> = this.model = {}
+    this.options.name = options?.name || (this as any).__proto__.constructor.name
     this.collection = options?.collection
     this.handler = this.handler.bind(this)
 
-    for (const n in fields) {
-      const modelField: FieldDescriptionInternal = this.model[n] = {name: n} as any
-      let field: FieldDescriptionObject = fields[n] as any
+    for (const n in schema) {
+      const modelField: ResolvedFieldSchema = this.model[n] = {name: n} as any
+      let field: ModelFieldSchema = schema[n] as any
       let fieldType: any, isArray: boolean = false
       if (typeof field === 'object' && !Array.isArray(field) && !(field instanceof Model))
         fieldType = field.type
@@ -3221,7 +3295,7 @@ export class Model {
       if (fieldType instanceof Model) {
         modelField.model = fieldType
         fieldType = 'model'
-        validateType = (value: any, options: ModelValidateFieldOptions) => modelField.model?.validate(value, options)
+        validateType = (value: any, options: ModelValidateFieldOptions) => modelField.model?.document(value, options)
       } else {
         fieldType = fieldType.toString().toLowerCase()
         switch (fieldType) {
@@ -3373,16 +3447,21 @@ export class Model {
     }
   }
 
+  /** Get model name */
+  get name() {
+    return this.options.name
+  }
+
   /** Validate data over model */
-  validate (data: Document, options?: ModelValidateOptions): Document {
+  document (data: Record<string, any>, options?: ModelContextOptions): ModelDocument<TSchema> {
     options = options || {}
     const prefix: string = (options as any).name ? (options as any).name + '.' : ''
     if (options.validate === false)
-      return data
-    const res: Document = {}
+      return data as ModelDocument<TSchema>
+    const res = {} as ModelDocument<any>
     for (const name in this.model) {
-      const field = this.model[name] as FieldDescriptionInternal
-      const paramOptions = {...options, field, name: prefix + name, model: this}
+      const field = this.model[name] as ResolvedFieldSchema
+      const paramOptions = {...this.options, ...options, field, name: prefix + name, model: this}
       const canWrite = field.canWrite(paramOptions), canRead = field.canRead(paramOptions), required = field.required?.(paramOptions)
       if (options.readOnly) {
         if (canRead === false || !field.type)
@@ -3414,7 +3493,7 @@ export class Model {
         continue
       res[name] = this._validateField(v, paramOptions)
     }
-    return res
+    return res as ModelDocument<TSchema>
   }
 
   private _fieldFunction(value: any, def?: any): ModelCallbackFunc {
@@ -3436,7 +3515,7 @@ export class Model {
   }
 
   private _validateField (value: any, options: ModelValidateFieldOptions): any {
-    const field: FieldDescriptionInternal = options.field
+    const field: ResolvedFieldSchema = options.field
     if (value == null) {
       if (field.required?.(options) && (!options.insert || options.name !== '_id'))
         throw new InvalidData('missing ' + options.name, 'field')
@@ -3446,14 +3525,14 @@ export class Model {
   }
 
   /** Generate filter for data queries */
-  getFilter (data: Document, options?: ModelValidateOptions): Document {
-    const res: Document = {}
+  getFilter (data: Record<string, any>, options?: ModelContextOptions): Record<string, any> {
+    const res: Record<string, any> = {}
     if (data._id)
       res._id = data._id
     for (const name in this.model) {
       if (!(name in res)) {
-        const field = this.model[name] as FieldDescriptionInternal
-        const paramOptions = {...options, field, name, model: this}
+        const field = this.model[name] as ResolvedFieldSchema
+        const paramOptions = {...this.options, ...options, field, name, model: this}
         if ((!options?.required && name in data) || (field.required && field.default)) {
           if (typeof field.required === 'function' && field.required(paramOptions) && field.default && (!(name in data) || field.canWrite(options) === false))
             res[name] = options?.default !== false ? field.default.length ? field.default(paramOptions) : (field.default as Function)() : data[name]
@@ -3471,40 +3550,43 @@ export class Model {
   }
 
   /** Find one document */
-  async findOne (query: Query, options?: ModelValidateOptions): Promise<Document|undefined> {
+  async findOne (query: Query, options?: ModelContextOptions): Promise<ModelDocument<TSchema>|undefined> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
-    const doc = await this.collection.findOne(this.getFilter(query, {readOnly: true, ...options}))
-    return doc ? this.validate(doc, {readOnly: true}) : undefined
+    options = {readOnly: true, ...this.options, ...options}
+    const doc = await this.collection.findOne(this.getFilter(query, options))
+    return doc ? this.document(doc, options) : undefined
   }
 
   /** Find many documents */
-  async findMany (query: Query, options?: ModelValidateOptions): Promise<Document[]> {
+  async findMany (query: Query, options?: ModelContextOptions): Promise<ModelDocument<TSchema>[]> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
-    const res: Document[] = []
-    await this.collection.find(this.getFilter(query || {}, options)).forEach((doc: Document) => res.push(this.validate(doc, {readOnly: true})))
+    const res: ModelDocument<TSchema>[] = []
+    options = {readOnly: true, ...this.options, ...options}
+    await this.collection.find(this.getFilter(query || {}, options)).forEach((doc: ModelDocument<TSchema>) => res.push(this.document(doc, options)))
     return res
   }
 
   /** Insert a new document */
-  async insert (data: Document, options?: ModelValidateOptions): Promise<void> {
+  async insert (data: Record<string, any>, options?: ModelContextOptions): Promise<void> {
     return this.update(data, {...options, insert: true})
   }
 
   /** Update one matching document */
-  async update (query: Query, options?: ModelValidateOptions): Promise<void> {
+  async update (query: Record<string, any>, options?: ModelContextOptions): Promise<void> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
+    options = {...this.options, ...options}
     if (options?.validate !== false)
-      query = this.validate(query, options)
-    const unset: {[key: string]: number} = query.$unset || {}
+      query = this.document(query, options)
+    const unset: Record<string, number> = query.$unset || {}
     for (const n in query) {
       if (query[n] === undefined || query[n] === null) {
         query.$unset = unset
@@ -3516,13 +3598,13 @@ export class Model {
   }
 
   /** Delete one matching document */
-  async delete (query: Query, options?: ModelValidateOptions): Promise<void> {
+  async delete (query: Query, options?: ModelContextOptions): Promise<void> {
     if (this.collection instanceof Promise)
       this.collection = await this.collection
     if (!this.collection)
       throw new AccessDenied('Database not configured')
     if (query._id)
-      await this.collection.deleteOne(this.getFilter(query, options))
+      await this.collection.deleteOne(this.getFilter(query, {...this.options, ...options}))
   }
 
   /** Microserver middleware */
@@ -3559,7 +3641,7 @@ export class Model {
   }
 }
 
-export declare interface MicroCollectionOptions {
+export declare interface MicroCollectionOptions<T extends ModelSchema = any> {
   /** Collection name */
   name?: string
   /** Collection persistent store */
@@ -3567,23 +3649,19 @@ export declare interface MicroCollectionOptions {
   /** Custom data loader */
   load?: (col: MicroCollection) => Promise<object>
   /** Custom data saver */
-  save?: (id: string, doc: Document | undefined, col: MicroCollection) => Promise<Document>
+  save?: (id: string, doc: ModelDocument<T> | undefined, col: MicroCollection) => Promise<ModelDocument<T>>
   /** Preloaded data object */
-  data?: {[key: string]: Document}
+  data?: Record<string, ModelDocument<T>>
 }
 
 export declare interface Query {
   [key: string]: any
 }
 
-export declare interface Document {
-  [key: string]: any
-}
-
 /** Cursor */
-export declare interface Cursor {
+export declare interface Cursor<T extends ModelSchema> {
   forEach (cb: Function, self?: any): Promise<number>
-  all (): Promise<Document[]>
+  all (): Promise<ModelDocument<T>[]>
 }
 
 /** Find options */
@@ -3601,53 +3679,41 @@ export declare interface FindOptions {
 }
 
 /** Collection factory */
-class MicroCollections implements ModelCollections {
-  protected options: MicroCollectionOptions
-  constructor (options: MicroCollectionOptions) {
-    this.options = options
+export class MicroCollectionStore {
+  private _collections: Map<string, MicroCollection> = new Map()
+  private _store?: FileStore
+
+  constructor (dataPath?: string) {
+    if (dataPath)
+      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, '')})
   }
 
   /** Get collection */
   async collection(name: string): Promise<MicroCollection> {
-    return new MicroCollection({...this.options, name})
+    if (!this._collections.has(name)) {
+      const data = await this._store?.load(name, true) || {}
+      this._collections.set(name, new MicroCollection({data, name}))
+    }
+    return this._collections.get(name) as MicroCollection
   }
 }
 
 /** minimalistic indexed mongo type collection with persistance for usage with Model */
-export class MicroCollection {
+export class MicroCollection<TSchema extends ModelSchema = any> {
   /** Collection name */
   public name: string
   /** Collection data */
-  public data: {[key: string]: Document}
+  public data: Record<string, ModelDocument<TSchema>>
+  private _save?: (id: string, doc: ModelDocument<TSchema> | undefined, col: MicroCollection) => Promise<ModelDocument<TSchema>>
 
-  private _ready: Promise<void> | undefined
-  private _save?: (id: string, doc: Document | undefined, col: MicroCollection) => Promise<Document>
-
-  /** Get collections factory */
-  static collections(options: MicroCollectionOptions): ModelCollections {
-    return new MicroCollections(options)
-  }
-
-  constructor(options: MicroCollectionOptions = {}) {
+  constructor(options: MicroCollectionOptions<TSchema> = {}) {
     this.name = options.name || this.constructor.name
-    const load = options.load ?? (options.store && ((col: MicroCollection) => options.store?.load(col.name, true)))
     this.data = options.data || {}
     this._save = options.save
-    this._ready = load?.(this)?.catch(() => {}).then(data => {
-      this.data = data || {}
-    })
-  }
-
-  /** check for collection is ready */
-  protected async checkReady() {
-    if (this._ready) {
-      await this._ready
-      this._ready = undefined
-    }
   }
 
   /** Query document with query filter */
-  protected queryDocument(query?: Query, data?: Document) {
+  protected queryDocument(query?: Query, data?: ModelDocument<TSchema>) {
     if (query && data)
       for (const n in query) {
         if (query[n] === null)
@@ -3665,26 +3731,23 @@ export class MicroCollection {
 
   /** Count all documents */
   async countDocuments(): Promise<number> {
-    await this.checkReady()
     return Object.keys(this.data).length
   }
 
   /** Find one matching document */
-  async findOne(query: Query): Promise<Document|undefined> {
-    await this.checkReady()
+  async findOne(query: Query): Promise<ModelDocument<TSchema>|undefined> {
     const id: string = query._id
     if (id)
       return this.queryDocument(query, this.data[id])
     let res
-    await this.find(query).forEach((doc: Document) => (res = doc) && false)
+    await this.find(query).forEach((doc: ModelDocument<TSchema>) => (res = doc) && false)
     return res
   }
 
   /** Find all matching documents */
-  find(query: Query): Cursor {
+  find(query: Query): Cursor<TSchema> {
     return {
-      forEach: async (cb: (doc: Document) => boolean | void, self?: any): Promise<number> => {
-        await this._ready
+      forEach: async (cb: (doc: ModelDocument<any>) => boolean | void, self?: any): Promise<number> => {
         let count: number = 0
         for (const id in this.data)
           if (this.queryDocument(query, this.data[id])) {
@@ -3696,8 +3759,7 @@ export class MicroCollection {
           }
         return count
       },
-      all: async (): Promise<Document[]> => {
-        await this._ready
+      all: async (): Promise<ModelDocument<TSchema>[]> => {
         return Object.values(this.data).filter(doc => this.queryDocument(query, doc))
       }
     }
@@ -3707,17 +3769,17 @@ export class MicroCollection {
   async findAndModify(options: FindOptions): Promise<number> {
     if (!options.query)
       return 0
-    await this.checkReady()
     const id = ((options.upsert || options.new) && !options.query._id) ? newObjectId() : options.query._id
     if (!id) {
       let count: number = 0
-      this.find(options.query).forEach((doc: Document) => {
+      let promise = Promise.resolve()
+      this.find(options.query).forEach((doc: ModelDocument<TSchema>) => {
         if (this.queryDocument(options.query, doc)) {
           Object.assign(doc, options.update)
           if (this._save) {
-            if (!this._ready)
-              this._ready = Promise.resolve()
-            this._ready = this._ready.then(async () => {
+            promise = promise.then(async () => {
+              if (!doc._id)
+                throw new Error('Internal error: missing _id in document')
               this.data[doc._id] = await this._save?.(doc._id, doc, this) || this.data[doc._id]
             })
           }
@@ -3726,13 +3788,14 @@ export class MicroCollection {
             return false  
         }
       })
+      await promise
       return count
     }
     let doc = this.queryDocument(options.query, this.data[id])
     if (!doc) {
       if (!options.upsert && !options.new)
         throw new InvalidData(`Document not found`)
-      doc = {_id: id}
+      doc = {_id: id} as ModelDocument<TSchema>
       this.data[id] = doc
     } else {
       if (options.new)
@@ -3741,7 +3804,7 @@ export class MicroCollection {
     if (options.update) {
       for (const n in options.update) {
         if (!n.startsWith('$'))
-          doc[n] = options.update[n]
+          (doc as any)[n] = options.update[n]
       }
       if (options.update.$unset) {
         for (const n in options.update.$unset)
@@ -3754,14 +3817,12 @@ export class MicroCollection {
   }
 
   /** Insert one document */
-  async insertOne(doc: Document): Promise<Document> {  
-    await this.checkReady()
+  async insertOne(doc: ModelDocument<TSchema>): Promise<ModelDocument<TSchema>> {  
     if (doc._id && this.data[doc._id])
       throw new InvalidData(`Document ${doc._id} dupplicate`)
+    doc = {...doc}
     if (!doc._id)
-      doc._id = {_id: newObjectId(), ...doc}
-    else
-      doc = {...doc}
+      doc._id = newObjectId()
     this.data[doc._id] = doc
     if (this._save)
       this.data[doc._id] = doc = await this._save(doc._id, doc, this) || doc
@@ -3769,8 +3830,7 @@ export class MicroCollection {
   }
 
   /** Insert multiple documents */
-  async insertMany(docs: Document[]): Promise<Document[]> {  
-    await this.checkReady()
+  async insertMany(docs: ModelDocument<TSchema>[]): Promise<ModelDocument<TSchema>[]> {  
     docs.forEach(doc => {
       if (doc._id && this.data[doc._id])
         throw new InvalidData(`Document ${doc._id} dupplicate`)
@@ -3785,29 +3845,28 @@ export class MicroCollection {
     const id = query._id
     if (!id)
       return
-    await this.checkReady()
     delete this.data[id]
   }
 
   /** Delete all matching documents */
   async deleteMany(query: Query): Promise<number> {
     let count: number = 0
-    await this.checkReady()
-    this.find(query).forEach((doc: Document) => {
+    let promise = Promise.resolve()
+    this.find(query).forEach((doc: ModelDocument<TSchema>) => {
       if (this.queryDocument(query, doc)) {
         count++
+        if (!doc._id)
+          return
         delete this.data[doc._id]
-        if (this._save) {
-          if (!this._ready)
-            this._ready = Promise.resolve()
-          this._ready = this._ready.then(async () => {this._save?.(doc._id, undefined, this)})
-        }
+        if (this._save)
+          promise = promise.then(async () => {doc._id && this._save?.(doc._id, undefined, this)})
       }
     })
+    await promise
     return count
   }
 
-  async updateOne(query: Query, doc: Document, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
+  async updateOne(query: Query, doc: ModelDocument<TSchema>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
     const count = await this.findAndModify({
       query,
       update: doc,
