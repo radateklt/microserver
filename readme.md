@@ -113,39 +113,26 @@ const server = new MicroServer({
     users: {
       usr: {
         password: 'secret',
-        acl: {user: true}
+        acl: {
+          user: true,
+          'user/insert': true
+        }
       }
     }
   }
 })
 
-class RestApi extends Controller {
-  static acl = '' // default acl
-
-  gethello(id) {
-    return {message:'Hello ' + id + '!'}
-  }
-
-  async postlogin() {
-    const user = await this.auth.login(this.body.user, this.body.password)
-    return user ? {user} : 403
-  }
-
-  static 'acl:protected' = 'user'
-  static 'url:protected' = 'GET /protected'
-  protected() {
-    return {message:'Protected'}
-  }
-}
+new MicroCollectionStore('data') // initialize simple file store for models
+//new MicroCollectionStore() // initialize simple memory store for models
 
 class RestApi extends Controller {
   static acl = '' // default acl
 
-  gethello(id) {
+  gethello(id) { // same as 'GET /hello'
     return {message:'Hello ' + id + '!'}
   }
 
-  async postlogin() {
+  async post_login() { // same as 'POST /login'
     const user = await this.auth.login(this.body.user, this.body.password)
     return user ? {user} : 403
   }
@@ -172,13 +159,13 @@ const UserModel = Model.define({
 class UserController extends Controller<typeof UserModel> {
   static model = UserModel
 
-  static 'acl:get' = 'user/get'
-  get(id: string) {
+  static 'acl:get' = 'user'
+  get(id: string) { // same as 'GET /'
     this.model.findOne({id})
   }
 
   static 'acl:insert' = 'user/insert'
-  insert() {
+  insert() { // same as 'POST /'
     this.model.insert(this.req.body)
   }
 }

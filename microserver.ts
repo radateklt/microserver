@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.1
+ * @version 2.3.2
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -538,21 +538,22 @@ export class ServerResponse<T = any> extends http.ServerResponse {
 
 /** WebSocket options */
 export interface WebSocketOptions {
-  maxPayload?: number,
-  autoPong?: boolean,
-  permessageDeflate?: boolean,
-  maxWindowBits?: number,
+  maxPayload?: number
+  autoPong?: boolean
+  permessageDeflate?: boolean
+  maxWindowBits?: number
+  timeout?: number
   deflate?: boolean
 } 
 
 /** WebSocket frame object */
 interface WebSocketFrame {
-  fin: boolean,
-  rsv1: boolean,
-  opcode: number,
-  length: number,
-  mask: Buffer,
-  lengthReceived: number,
+  fin: boolean
+  rsv1: boolean
+  opcode: number
+  length: number
+  mask: Buffer
+  lengthReceived: number
   index: number
 }
 
@@ -575,7 +576,10 @@ export class WebSocket extends EventEmitter{
       maxPayload: 1024 * 1024,
       permessageDeflate: false,
       maxWindowBits: 15,
+      timeout: 120000,
       ...options} 
+
+    this._socket.setTimeout(this._options.timeout || 120000)
 
     const key: string | undefined = req.headers['sec-websocket-key']
     const upgrade: string | undefined = req.headers.upgrade
@@ -1084,53 +1088,58 @@ interface RouterItem {
   tree?: Record<string, RouterItem>
 }
 
-class Waiter {
-  private _waiters: any = {}
-  private _id: number = 0
-  private _busy: number = 0
+class WaiterJob {
+  _waiters: any = []
+  _busy: number = 0
 
-  get busy() {
-    return this._busy > 0
-  }
-
-  startJob() {
+  start() {
     this._busy++
   }
 
-  endJob(id?: string) {
+  end() {
     this._busy--
+    for (const resolve of this._waiters.splice(0))
+      resolve()
+  }
+
+  async wait() {
     if (!this._busy)
-      this.resolve(id || 'ready')
+      return
+    return new Promise<void>(resolve => this._waiters.push(resolve))
+  }
+}
+
+class Waiter {
+  private _id: number = 0
+  private _waiters: Record<string, WaiterJob> = {}
+
+  isBusy(id?: string) {
+    const waiter = this._waiters[id || 'ready']
+    return !!waiter?._busy
+  }
+
+  startJob(id?: string) {
+    let waiter = this._waiters[id || 'ready']
+    if (!waiter)
+      waiter = this._waiters[id || 'ready'] = new WaiterJob()
+    waiter._busy++
+  }
+
+  endJob(id?: string) {
+    const waiter = this._waiters[id || 'ready']
+    if (waiter)
+      waiter.end()
   }
 
   get nextId() {
     return (++this._id).toString()
   }
 
-  async wait(id: string): Promise<void> {
-    return new Promise<void>(resolve => (this._waiters[id] = this._waiters[id] || []).push(resolve))
-  }
-
-  resolve(id: string): void {
-    const resolvers = this._waiters[id]
-    if (resolvers)
-      for (const resolve of resolvers)
-        resolve(undefined)
-      delete this._waiters[id]
-  }
-}
-
-class EmitterWaiter extends Waiter {
-  private _emitter: EventEmitter
-  constructor (emitter: EventEmitter) {
-    super()
-    this._emitter = emitter
-  }
-
-  resolve(id: string): void {
-    if (id === 'ready')
-      this._emitter.emit(id)
-    super.resolve(id)
+  async wait(id?: string): Promise<void> {
+    const waiter = this._waiters[id || 'ready']
+    if (!waiter)
+      return
+    return waiter.wait()
   }
 }
 
@@ -1551,7 +1560,7 @@ export class Router extends EventEmitter {
     if (plugin.routes)
       await this.use(isFunction(plugin.routes) ? await plugin.routes() : plugin.routes)
     if (added)
-      this._waiter.resolve(added)
+      this.emit(added)
   }
 
   async waitPlugin (id: string): Promise<Plugin> {
@@ -1647,21 +1656,15 @@ export class MicroServer extends EventEmitter {
   /** server instances */
   public servers: Set<net.Server>
 
-  _waiter: Waiter = new EmitterWaiter(this)
+  _waiter: Waiter = new Waiter()
 
   public static plugins: {[key: string]: PluginClass} = {}
-  
   private _methods: {[key: string]: boolean} = {}
-  private _init: (f: Function, ...args: any[]) => void
 
   constructor (config: MicroServerConfig) {
     super()
 
     let promise = Promise.resolve()
-    this._init = (f: Function, ...args: any[]) => {
-      promise = promise.then(() => f.apply(this, args)).catch(e => this.emit('error', e))
-    }
-
     this.config = {
       maxBodySize: defaultMaxBodySize,
       methods: defaultMethods,
@@ -1682,18 +1685,21 @@ export class MicroServer extends EventEmitter {
         this.router.use(MicroServer.plugins[key], config[key])
     }
 
-    if (config.listen)
-      this._init(() => {
-        this.listen({
-          tls: config.tls,
-          listen: config.listen || 8080
-        })
+    if (config.listen) {
+      this._waiter.startJob()
+      this.listen({
+        tls: config.tls,
+        listen: config.listen || 8080
+      }).then(() => {
+        this._waiter.endJob()
       })
+    }
+    this._waiter.wait().then(() => this.emit('ready'))
   }
 
   /** Add one time listener or call immediatelly for 'ready' */
   once (name: string, cb: Function) {
-    if (name === 'ready' && this.isReady())
+    if (name === 'ready' && this.isReady)
       cb()
     else
       super.once(name, cb as any)
@@ -1702,20 +1708,20 @@ export class MicroServer extends EventEmitter {
 
   /** Add listener and call immediatelly for 'ready'  */
   on (name: string, cb: Function) {
-    if (name === 'ready' && this.isReady())
+    if (name === 'ready' && this.isReady)
       cb()
     super.on(name, cb as any)
     return this
   }
 
-  public isReady(): boolean {
-    return !this._waiter.busy
+  public get isReady(): boolean {
+    return !this._waiter.isBusy()
   }
 
   async waitReady (): Promise<void> {
-    if (this.isReady())
+    if (this.isReady)
       return
-    return this._waiter.wait("ready")
+    return this._waiter.wait()
   }
 
   async waitPlugin (id: string): Promise<void> {
@@ -1751,7 +1757,7 @@ export class MicroServer extends EventEmitter {
 
     const reg = /^((?<proto>\w+):\/\/)?(?<host>(\[[^\]]+\]|[a-z][^:,]+|\d+\.\d+\.\d+\.\d+))?:?(?<port>\d+)?/
     listen.split(',').forEach(listen => {
-      this._waiter.startJob()
+      this._waiter.startJob('listen')
       let {proto, host, port} = reg.exec(listen)?.groups || {}
       let srv: net.Server | http.Server | https.Server
       switch (proto) {
@@ -1779,20 +1785,20 @@ export class MicroServer extends EventEmitter {
 
       this.servers.add(srv)
       if (port === '0') // skip listening
-        this._waiter.endJob()
+        this._waiter.endJob('listen')
       else {
         srv.listen(parseInt(port), host?.replace(/[\[\]]/g, '') || '0.0.0.0', () => {
           const addr: net.AddressInfo = srv.address() as net.AddressInfo
           this.emit('listen', addr.port, addr.address, srv);
           (srv as any)._ready = true
-          this._waiter.endJob()
+          this._waiter.endJob('listen')
         })
       }
       srv.on('error', err => {
         srv.close()
         this.servers.delete(srv)
         if (!(srv as any)._ready)
-          this._waiter.endJob()
+          this._waiter.endJob('listen')
         this.emit('error', err)
       })
       srv.on('connection', s => {
@@ -1801,7 +1807,7 @@ export class MicroServer extends EventEmitter {
       })
       srv.on('upgrade', this.handlerUpgrade.bind(this))
     })
-    return this._waiter.wait('ready')
+    return this._waiter.wait('listen')
   }
 
   /** Add middleware, routes, etc.. see {router.use} */
@@ -1965,7 +1971,6 @@ export class MicroServer extends EventEmitter {
       this.sockets.clear()
     }).then(() => {
       this.emit('close')
-      this._waiter.resolve("close")
     })
   }
 
@@ -2470,6 +2475,27 @@ export interface AuthOptions {
   cacheCleanup?: number
 }
 
+export interface AuthOptionsInternal extends AuthOptions {
+  /** Authentication token */
+  token: Buffer
+  /** Users */
+  users: (usr: string, psw?: string) => Promise<UserInfo|undefined>
+  /** Default ACL */
+  defaultAcl: { [key: string]: boolean }
+  /** Expire time in seconds */
+  expire: number
+  /** Authentication mode */
+  mode: 'cookie' | 'token'
+  /** Authentication realm for basic authentication */
+  realm: string
+  /** Redirect URL */
+  redirect: string
+  /** Authentication cache */
+  cache: { [key: string]: { data: UserInfo, time: number } }
+  /** Interal next cache cleanup time */
+  cacheCleanup: number
+}
+
 /** Authentication class */
 export class Auth {
   /** Server request */
@@ -2477,35 +2503,14 @@ export class Auth {
   /** Server response */
   public res: ServerResponse | undefined
   /** Authentication options */
-  public options: AuthOptions
-  /** Get user function */
-  public users: ((usr: string, psw?: string, salt?: string) => Promise<UserInfo|undefined>)
+  public options: AuthOptionsInternal
   
-  constructor (options?: AuthOptions) {
-    let token: string | Buffer = options?.token || defaultToken
-    if (!token || token.length !== 32)
-      token = defaultToken
-    if (token.length !== 32)
-      token = crypto.createHash('sha256').update(token).digest()
-    if (!(token instanceof Buffer))
-      token = Buffer.from(token as string)
-    this.options = {
-      token,
-      users: options?.users,
-      mode: options?.mode || 'cookie',
-      defaultAcl: options?.defaultAcl || { '*': false },
-      expire: options?.expire || defaultExpire,
-      cache: options?.cache || {}
-    }
-    if (typeof options?.users === 'function')
-      this.users = options.users
-    else
-      this.users = async (usrid, psw) => {
-        const users: {[key: string]: UserInfo} | undefined = this.options.users as {[key: string]: UserInfo}
-        const usr: UserInfo | undefined = users?.[usrid]
-        if (usr && (psw === undefined || this.checkPassword(usrid, psw, usr.password || '')))
-          return usr
-      }
+  constructor (options: AuthOptionsInternal, req?: ServerRequest, res?: ServerResponse) {
+    this.options = options
+    this.req = req
+    this.res = res
+    if (req)
+      req.auth = this
   }
 
   /** Decode token */
@@ -2587,7 +2592,7 @@ export class Auth {
       data =  JSON.stringify(usr)
     else if (typeof usr === 'string') {
       if (psw !== undefined) {
-        const userInfo = await this.users(usr, psw)
+        const userInfo = await this.options.users(usr, psw)
         data = userInfo?.id || userInfo?._id
       } else
       data = usr
@@ -2604,7 +2609,7 @@ export class Auth {
     if (typeof usr === 'object')
       usrInfo = usr
     if (typeof usr === 'string')
-      usrInfo = await this.users(usr, psw, options?.salt)
+      usrInfo = await this.options.users(usr, psw)
     if (usrInfo?.id || usrInfo?._id) {
       const expire = Math.min(34560000, options?.expire || this.options.expire || defaultExpire)
       const expireTime = new Date().getTime() + expire * 1000
@@ -2781,20 +2786,36 @@ class AuthPlugin extends Plugin {
       ...options,
       cacheCleanup: new Date().getTime()
     }
-  
-    if (this.options.token === defaultToken)
+
+    if (options?.token === defaultToken)
       console.warn('Default token in auth plugin')
 
-    router.auth = new Auth(this.options)
+    let token: string | Buffer = options?.token || defaultToken
+    if (!token || token.length !== 32)
+      token = defaultToken
+    if (token.length !== 32)
+      token = crypto.createHash('sha256').update(token).digest()
+    if (!(token instanceof Buffer))
+      token = Buffer.from(token as string)
+    this.options.token = token
+
+    if (typeof options?.users === 'function')
+      this.options.users = (usr, psw) => (options.users as (usr: string, psw?: string) => Promise<UserInfo|undefined>)(usr, psw)
+    else {
+      this.options.users = async (usrid, psw) => {
+        const users: {[key: string]: UserInfo} | undefined = this.options.users as {[key: string]: UserInfo}
+        const usr: UserInfo | undefined = users?.[usrid]
+        if (usr && (psw === undefined || router.auth?.checkPassword(usrid, psw, usr.password || '')))
+          return usr
+      }
+    }
+    router.auth = new Auth(this.options as AuthOptionsInternal)
   }
 
   /** Authentication middleware */
   async handler (req: ServerRequest, res: ServerResponse, next: Function) {
     const options: AuthOptions = this.options, cache = options.cache
-    const auth = new Auth(options)
-    req.auth = auth
-    auth.req = req
-    auth.res = res
+    const auth = new Auth(this.options as AuthOptionsInternal, req, res)
     
     const authorization = req.headers.authorization || '';
     if (authorization.startsWith('Basic ')) {
@@ -2805,7 +2826,7 @@ class AuthPlugin extends Plugin {
         const usrpsw = Buffer.from(authorization.slice(6), 'base64').toString('utf-8'),
           pos = usrpsw.indexOf(':'), username = usrpsw.slice(0, pos), psw = usrpsw.slice(pos + 1)
         if (username && psw)
-          req.user = await auth.users(username, psw)
+          req.user = await auth.options.users(username, psw)
         if (!req.user)
           return res.error(401)
         if (cache) // 1 hour to expire in cache
@@ -2844,7 +2865,7 @@ class AuthPlugin extends Plugin {
       else {
         const usrData = auth.decode(token)
         if (!usrData.data) {
-          req.auth.logout()
+          req.auth!.logout()
           return new AccessDenied()
         }
         if (usrData.data.startsWith('{')) {
@@ -2853,9 +2874,9 @@ class AuthPlugin extends Plugin {
             req.user = usr
           } catch (e) { }
         } else {
-          req.user = await auth.users(usrData.data)
+          req.user = await auth.options.users(usrData.data)
           if (!req.user) {
-            req.auth.logout()
+            req.auth!.logout()
             return new AccessDenied()
           }
         }
@@ -2865,7 +2886,7 @@ class AuthPlugin extends Plugin {
       }
       // renew
       if (req.user && expire < (options.expire || defaultExpire) / 2)
-        await req.auth.login(req.user)
+        await req.auth!.login(req.user)
     }
     if (!res.headersSent)
       return next()
@@ -2907,7 +2928,7 @@ export class FileStore {
     this._dir = options?.dir || 'data'
     this._cacheTimeout = options?.cacheTimeout || 2000
     this._cacheItems = options?.cacheItems || 10
-    this._debounceTimeout = options?.debounceTimeout || 1000
+    this._debounceTimeout = options?.debounceTimeout ?? 1000
     this._iter = 0
   }
 
@@ -2966,16 +2987,16 @@ export class FileStore {
       if (item && new Date().getTime() - item.atime < this._cacheTimeout)
         return item.data
       try {
-        const stat = await fs.promises.lstat(path.join(this._dir, name))
-        if (item?.mtime !== stat.mtime.getTime()) {
-          let data: object = JSON.parse(await fs.promises.readFile(path.join(this._dir, name), 'utf8') || '{}')
+        const stat = await fs.promises.lstat(path.join(this._dir, name)).catch(() => null)
+        if (!stat || item?.mtime !== stat.mtime.getTime()) {
+          let data: object = stat ? JSON.parse(await fs.promises.readFile(path.join(this._dir, name), 'utf8').catch(() => '') || '{}') : {}
           this._iter++
           this.cleanup()
           if (autosave)
             data = this.observe(data, () => this.save(name, data))
           this._cache[name] = {
             atime: new Date().getTime(),
-            mtime: stat.mtime.getTime(),
+            mtime: stat?.mtime.getTime() || new Date().getTime(),
             data: data
           }
           return data
@@ -3239,18 +3260,37 @@ export declare interface ModelCollections {
   collection(name: string): Promise<MicroCollection>
 }
 
+class ModelCollectionsInternal implements ModelCollections {
+  private _ready!: Function
+  private _wait: Promise<this> = new Promise(resolve => this._ready = resolve)
+  private _db: any
+  set db(db: any) {
+    Promise.resolve(db).then(db => this._ready(this._db = db))
+  }
+  get db(): any {
+    return this._db 
+  }
+  async collection(name: string): Promise<MicroCollection> {
+    const db = await this._wait
+    return db.collection(name)
+  }
+}
+
 export class Model<TSchema extends ModelSchema> {
-  static collections?: ModelCollections
+  static collections: ModelCollections = new ModelCollectionsInternal()
   static models: Record<string, Model<any>> = {}
 
-  static schema(schema: ModelSchema): ModelSchema {
-    return schema
+  static set db(db: any) {
+    (this.collections as ModelCollectionsInternal).db = db
+  }
+  static get db(): any {
+    return (this.collections as ModelCollectionsInternal).db
   }
 
   /** Define model */
   static define<T extends ModelSchema>(name: string, schema: T, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model<T> {
     options = options || {}
-    if (!options.collection && this.collections)
+    if (!options.collection)
       options.collection = this.collections.collection(name)
     const inst: Model<T> = options?.class
       ? new options.class(schema, {name, ...options})
@@ -3682,9 +3722,11 @@ export class MicroCollectionStore {
   private _collections: Map<string, MicroCollection> = new Map()
   private _store?: FileStore
 
-  constructor (dataPath?: string) {
+  constructor (dataPath?: string, storeTimeDelay?: number) {
     if (dataPath)
-      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, '')})
+      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, ''), debounceTimeout: storeTimeDelay ?? 1000})
+    if (!Model.db)
+      Model.db = this
   }
 
   /** Get collection */

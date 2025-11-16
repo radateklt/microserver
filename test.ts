@@ -1,6 +1,6 @@
 import assert from 'assert'
 import fs from 'fs/promises'
-import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin, MicroCollectionStore } from './microserver.ts'
+import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin, MicroCollectionStore, type UserInfo } from './microserver.ts'
 type Routes = import('./microserver.ts').Routes
 
 const test: {
@@ -89,7 +89,16 @@ test('Prepare', async () => {
 test('Start server', async () => {
   server = new MicroServer({
     cors: '*',
-    listen: parseInt(request.url.match(/:(\d+)/)?.[1] || '80')
+    listen: parseInt(request.url.match(/:(\d+)/)?.[1] || '80'),
+    auth: {
+      token: 'test',
+      users: {
+        test: {
+          id: 'test',
+          password: 'test'
+        }
+      }
+    }
   })
   await server.waitReady()
   let listen = false
@@ -182,7 +191,7 @@ test('Static', async () => {
 })
 
 test('Routes: stack', async () => {
-  assert.equal((server.router as any)._stack.length, 0, 'Invalid stack')
+  assert.equal((server.router as any)._stack.length, 1, 'Invalid stack')
   server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
     if (req.query.test)
       return {test: req.query.test, body: req.body}
@@ -368,9 +377,7 @@ test('Controller', async () => {
     await server.use('/api', TestController)
     await server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
       req.user = {id: 'test', acl: {get: true, insert: false, update: true, all: false}}
-      req.auth = new Auth(req.router?.auth?.options)
-      req.auth.req = req
-      req.auth.res = res
+      new Auth(req.router!.auth!.options, req, res)
       next()
     })  
   })
@@ -515,7 +522,17 @@ test('Stop server', async () => {
 })
 
 test('Auth', async () => {
-  const auth = new Auth({ token: 'test', users: {test: {id: 'test', password: 'secret'}}})
+  const auth = new Auth({
+    token: Buffer.from('test'.repeat(8)),
+    users: async (usr, psw): Promise<UserInfo | undefined>  => usr === 'test' && psw === 'secret' ? {id: 'test'} as UserInfo : undefined,
+    defaultAcl: {},
+    expire: 10,
+    cache: {},
+    cacheCleanup: 0,
+    mode: 'token',
+    realm: 'test',
+    redirect: '/'
+  })
   let enc1: string, enc2: string
   test('encode1', () => {
     enc1 = auth.encode('test', 10)
@@ -567,16 +584,16 @@ test('Auth', async () => {
 })
 
 test('Server Auth', async () => {
-  const usersCollection = await new MicroCollectionStore('tmp').collection('users')
+  const db = new MicroCollectionStore('tmp', 0)
 
-  const userProfile = new Model({
+  const userProfile = Model.define('user', {
     _id: String,
     name: { type: 'string', required: true },
     email: { type: 'string', format: 'email' },
     password: { type: 'string', canRead: false },
     group: { type: 'string' },
     acl: { type: 'object' }
-  }, { collection: usersCollection, name: 'user' })
+  })
 
   const server = new MicroServer({
     listen: 3100,
@@ -600,7 +617,7 @@ test('Server Auth', async () => {
   server.use('POST /admin/user', 'group:admins', 'acl:user/insert', userProfile)
   server.use('PUT /admin/user/:id', 'acl:user/update', userProfile)
   server.use('DELETE /admin/user/:id', 'acl:user/delete', userProfile)
-  await new Promise((resolve: Function) => server.on('ready', () => resolve()))
+  await server.waitReady()
 
   let optionsAdmin: any, optionsTest: any
 
@@ -680,3 +697,4 @@ test('Server Auth', async () => {
 test('Cleanup', async () => {
   await fs.rm('./tmp', { recursive: true })
 })
+
