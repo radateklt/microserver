@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.2
+ * @version 2.3.3
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -925,8 +925,8 @@ const server = {}
  * ```
 */
 export class Controller<T extends Model<any> = any> {
-  protected req: ServerRequest<T>
-  protected res: ServerResponse<T>
+  req: ServerRequest<T>
+  res: ServerResponse<T>
 
   get model(): T | undefined {
     return this.req.model
@@ -980,10 +980,6 @@ export class Controller<T extends Model<any> = any> {
       if (keyMatch) {
         method = keyMatch[1]
         url = keyMatch[2].startsWith('/') ? keyMatch[2] : ('/' + prefix + keyMatch[2])
-      }
-      if (!url && !method) {
-        method = 'GET'
-        url = '/' + prefix + key
       }
       if (!method)
         return
@@ -1050,17 +1046,10 @@ export class Controller<T extends Model<any> = any> {
         res.isJson = true
         const obj: Controller = new this(req, res)
         if (modelName) {
-          req.model = modelName instanceof Model ? modelName : Model.models[modelName]
+          req.model = modelName instanceof Model ? modelName : (Model.models as any)[modelName]
           if (!obj.model)
             throw new InvalidData(modelName, 'model')
-          const modelOptions: Record<string, any> = {...obj.model.options, user: req.user, params: req.params}
-          req.model = new Proxy(req.model, {
-            get: (target: any, prop: string) => {
-              if (prop === 'options')
-                return modelOptions
-              return target[prop]
-            }
-          })
+          req.model = Model.dynamic(req.model, {controller: obj})
         }
         return func.apply(obj, req.paramsList)
       })
@@ -1201,7 +1190,7 @@ export class Router extends EventEmitter {
             return (req: ServerRequest, res: ServerResponse) => {
               res.isJson = true
               req.params.model = model
-              req.model = Model.models[model]
+              req.model = (Model.models as any)[model]
               if (!req.model) {
                 console.error(`Data model ${model} not defined for request ${req.path}`)
                 return res.error(422)
@@ -3276,9 +3265,12 @@ class ModelCollectionsInternal implements ModelCollections {
   }
 }
 
+export class Models {
+}
+
 export class Model<TSchema extends ModelSchema> {
   static collections: ModelCollections = new ModelCollectionsInternal()
-  static models: Record<string, Model<any>> = {}
+  static models: Models = {} as Models
 
   static set db(db: any) {
     (this.collections as ModelCollectionsInternal).db = db
@@ -3287,15 +3279,42 @@ export class Model<TSchema extends ModelSchema> {
     return (this.collections as ModelCollectionsInternal).db
   }
 
+  /** Dynamic model extension */
+  static dynamic<T extends Model<any>>(model: T, options: {controller?: Controller, collection?: MicroCollection<any>, req?: ServerRequest} | Controller): T {
+    if (options instanceof Controller)
+      options = {controller: options}
+    const collection = options?.collection || model.collection
+    const modelOptions: Record<string, any> = {...model.options}
+    const req = options.req || options.controller?.req
+    if (req) {
+      modelOptions.user = req.user
+      modelOptions.params = req.params
+    }
+    return new Proxy(model, {
+      get: (target: any, prop: string) => {
+        if (prop === 'collection')
+          return collection
+        if (prop === 'options')
+          return modelOptions
+        return target[prop]
+      }
+    })
+  }
+
+  static register<K extends string, T extends Model<any>>(name: K, model: T) {
+    (Model.models as any)[name] = model
+    return this
+  }
+
   /** Define model */
-  static define<T extends ModelSchema>(name: string, schema: T, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model<T> {
+  static define<K extends string, T extends ModelSchema>(name: K, schema: T, options?: {collection?: MicroCollection | Promise<MicroCollection>, class?: typeof Model}): Model<T> {
     options = options || {}
     if (!options.collection)
       options.collection = this.collections.collection(name)
     const inst: Model<T> = options?.class
       ? new options.class(schema, {name, ...options})
       : new Model(schema, {name, ...options})
-    Model.models[name] = inst
+    this.register(name, inst)
     return inst
   }
 
