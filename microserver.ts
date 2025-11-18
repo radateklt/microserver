@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.3
+ * @version 2.3.4
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -1243,13 +1243,10 @@ export class Router extends EventEmitter {
   handler (req: ServerRequest, res: ServerResponse, next: Function, method?: string) {
     const nextAfter: Function = next
     next = () => this._walkStack(this._stackAfter, req, res, nextAfter)
-    if (method)
-      return !this._walkTree(this._tree[method], req, res, next) && next()
-    const walk = () => {
-      if (!this._walkTree(this._tree[req.method || 'GET'], req, res, next) &&
-        !this._walkTree(this._tree['*'], req, res, next))
-        next()
-    }
+    const walkTree = (method: string) => this._walkTree(this._tree[method], req, res, next)
+    const walk = method ?
+      () => { !walkTree(method) && next() } :
+      () => { !walkTree(req.method || 'GET') && !walkTree('*') && next() }
     req.rewrite = (url: string) => {
       if (req.originalUrl)
         res.error(508)
