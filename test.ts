@@ -642,16 +642,22 @@ test('Server Auth', async () => {
   test('Profile admin', async () => assert.equal((await GET('/profile', optionsAdmin))?.user?._id, 'admin'))
   test('Profile test', async () => assert.equal((await GET('/profile', optionsTest))?.user?._id, 'test'))
   test('Profile no auth', async () => assert.equal((await GET('/profile', { response: true}))?.status, 422))
-  test.skip('Secure subpath', async () => {
+  test('Secure subpath', async () => {
     // hook wirhout method does not work, needs new implementation
+    server.use('GET /tst1', () => 'tst1')
+    server.use('GET /tst1/tst2', () => 'tst2')
     server.use('GET /tst1/tst2/tst3', () => 'tst3')
     server.use('GET /tst1/tst2/tst3/tst4', () => 'tst4')
-    server.hook('/tst1', 'acl:user/get')
+    server.hook('/tst1/tst2', 'acl:user/get')
 
-    assert.equal((await GET('/tst1/tst2/tst3', optionsAdmin)), 'tst3')
-    assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsAdmin)), 'tst4')
-    assert.equal((await GET('/tst1/tst2/tst3', optionsTest)), 'tst3')
-    assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsTest)), 'tst4')
+    assert.equal((await GET('/tst1', optionsAdmin)), 'tst1', 'Failed admin tst1')
+    assert.equal((await GET('/tst1/tst2', optionsAdmin)), 'tst2', 'Failed admin tst1')
+    assert.equal((await GET('/tst1/tst2/tst3', optionsAdmin)), 'tst3', 'Failed admin tst3')
+    assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsAdmin)), 'tst4', 'Failed admin tst4')
+    assert.equal((await GET('/tst1', optionsTest)), 'tst1', 'Failed admin tst1')
+    assert.equal((await GET('/tst1/tst2', optionsTest)), 'Permission denied', 'Failed admin tst2')
+    assert.equal((await GET('/tst1/tst2/tst3', optionsTest)), 'Permission denied', 'Failed test tst3')
+    assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsTest)), 'Permission denied', 'Failed test tst4')
   })
   test('Update admin', async () => {
     assert.equal((await PUT('/admin/user/admin', {name: 'Test'}, optionsAdmin))?.success, true)

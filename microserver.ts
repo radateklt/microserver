@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.5
+ * @version 2.3.6
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -1561,10 +1561,13 @@ export class Router extends EventEmitter {
   /** Add hook */
   hook (url: string, ...mid: Middleware[]): void {
     const m = url.match(/^([A-Z]+) (.*)/)
-    let method = '*'
-    if (m)
-      [method, url] = [m[1], m[2]]
-    this._add(method, url, 'hook', mid)
+    if (m) {
+      const [method, url] = [m[1], m[2]]
+      this._add(method, url, 'hook', mid)
+    } else {
+      for (const method of ['*', 'GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+        this._add(method, url, 'hook', mid)
+    }
   }
 
   /** Check if middleware allready added */
