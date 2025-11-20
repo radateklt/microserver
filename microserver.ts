@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.4
+ * @version 2.3.5
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -26,7 +26,10 @@ const defaultMethods = 'HEAD,GET,POST,PUT,PATCH,DELETE'
 function NOOP (...args: any[]) { }
 
 function isFunction (fn: any): boolean {
-  return typeof fn === 'function' && !fn.prototype?.constructor;
+  if (typeof fn !== 'function')
+    return false
+  const descriptor = Object.getOwnPropertyDescriptor(fn, 'prototype')
+  return !descriptor || descriptor.writable === true
 }
 
 export class Warning extends Error {
