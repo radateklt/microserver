@@ -659,6 +659,10 @@ test('Server Auth', async () => {
     assert.equal((await GET('/tst1/tst2/tst3', optionsTest)), 'Permission denied', 'Failed test tst3')
     assert.equal((await GET('/tst1/tst2/tst3/tst4', optionsTest)), 'Permission denied', 'Failed test tst4')
   })
+  test('Get admin', async () => {
+    assert.equal((await GET('/admin/user/admin', optionsAdmin))?.data?.name, 'admin')
+    assert.deepEqual((await GET('/admin/user/test', optionsAdmin)), {success: true, data: {_id: 'test', name: 'Test'}})
+  })
   test('Update admin', async () => {
     assert.equal((await PUT('/admin/user/admin', {name: 'Test'}, optionsAdmin))?.success, true)
     assert.equal((await userProfile.findOne({_id: 'admin'}))?.name, 'Test')

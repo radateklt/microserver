@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.6
+ * @version 2.3.7
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -3137,8 +3137,8 @@ interface ModelContextOptions {
   validate?: boolean
   /** use default */
   default?: boolean
-  /** is required */
-  required?: boolean
+  /** use primary key only for filter */
+  primaryKey?: boolean
   /** projection fields */
   projection?: Record<string, 0|1|true|false>
 }
@@ -3166,6 +3166,8 @@ export interface ModelFieldSchema {
   type: ModelFieldSimpleType
   /** Is array */
   array?: true | false
+  /** Is primary key, used for filtering */
+  primaryKey?: true | false
   /** Is required */
   required?: boolean | string | ModelCallbackFunc
   /** Can read */
@@ -3189,6 +3191,7 @@ export interface ModelFieldSchema {
 interface ResolvedFieldSchema {
   type: string
   model?: Model<any>
+  primaryKey?: boolean
   required?: ModelCallbackFunc
   canRead: ModelCallbackFunc
   canWrite: ModelCallbackFunc
@@ -3450,7 +3453,8 @@ export class Model<TSchema extends ModelSchema> {
         }
       else
         modelField.validate = validate
-      modelField.required = field.required ? this._fieldFunction(field.required, false) : undefined
+      modelField.primaryKey = field.primaryKey
+      modelField.required = (field.primaryKey || field.required) ? this._fieldFunction(field.primaryKey ||field.required, false) : undefined
       modelField.canWrite = this._fieldFunction(field.canWrite, typeof field.canWrite === 'string' && field.canWrite.startsWith('$') ? false : true)
       modelField.canRead = this._fieldFunction(field.canRead, typeof field.canRead === 'string' && field.canRead.startsWith('$') ? false : true)
       if (field.default !== undefined) {
@@ -3518,11 +3522,14 @@ export class Model<TSchema extends ModelSchema> {
   document (data: Record<string, any>, options?: ModelContextOptions): ModelDocument<TSchema> {
     options = options || {}
     const prefix: string = (options as any).name ? (options as any).name + '.' : ''
-    if (options.validate === false)
-      return data as ModelDocument<TSchema>
     const res = {} as ModelDocument<any>
     for (const name in this.model) {
       const field = this.model[name] as ResolvedFieldSchema
+      if (options.validate === false) {
+        if (name in data)
+          res[name] = data[name]
+        continue
+      }
       const paramOptions = {...this.options, ...options, field, name: prefix + name, model: this}
       const canWrite = field.canWrite(paramOptions), canRead = field.canRead(paramOptions), required = field.required?.(paramOptions)
       if (options.readOnly) {
@@ -3595,19 +3602,10 @@ export class Model<TSchema extends ModelSchema> {
       if (!(name in res)) {
         const field = this.model[name] as ResolvedFieldSchema
         const paramOptions = {...this.options, ...options, field, name, model: this}
-        if ((!options?.required && name in data) || (field.required && field.default)) {
-          if (typeof field.required === 'function' && field.required(paramOptions) && field.default && (!(name in data) || field.canWrite(options) === false))
-            res[name] = options?.default !== false ? field.default.length ? field.default(paramOptions) : (field.default as Function)() : data[name]
-          else if (name in data)
-            res[name] = options?.validate !== false ? this._validateField(data[name], paramOptions) : data[name]
-        }
+        if ((!options?.primaryKey && name in data) || field.primaryKey)
+          res[name] = options?.validate !== false ? this._validateField(data[name], paramOptions) : data[name]
       }
     }
-    if (typeof options?.projection === 'object')
-      for (const name in options.projection) {
-        if (name !== '_id' && name in this.model && !res[name])
-          res[name] = options.projection[name]
-      }
     return res
   }
 
@@ -3656,7 +3654,7 @@ export class Model<TSchema extends ModelSchema> {
         delete query[n]
       }
     }
-    const res = await this.collection.findAndModify({query: this.getFilter(query, {required: true, validate: false, default: false}), update: query, upsert: options?.insert}) as ModelDocument<TSchema>
+    const res = await this.collection.findAndModify({query: this.getFilter(query, {primaryKey: true, validate: false}), update: query, upsert: options?.insert}) as ModelDocument<TSchema>
     if (!res)
       throw new NotFound('Document not found')
     return res
