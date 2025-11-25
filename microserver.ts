@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.8
+ * @version 2.3.9
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -3614,8 +3614,6 @@ export class Model<TSchema extends ModelSchema> {
   /** Find one document */
   async findOne (query: Query, options?: ModelContextOptions): Promise<ModelDocument<TSchema>|undefined> {
     const collection: MicroCollection = await this.collection!
-    if (!collection)
-      throw new AccessDenied('Database not configured')
     options = {readOnly: true, ...this.options, ...options}
     const doc = await collection.findOne(this.getFilter(query, options))
     return doc ? this.document(doc, options) : undefined
@@ -3624,8 +3622,6 @@ export class Model<TSchema extends ModelSchema> {
   /** Find many documents */
   async findMany (query: Query, options?: ModelContextOptions): Promise<ModelDocument<TSchema>[]> {
     const collection: MicroCollection = await this.collection!
-    if (!collection)
-      throw new AccessDenied('Database not configured')
     const res: ModelDocument<TSchema>[] = []
     options = {readOnly: true, ...this.options, ...options}
     await collection.find(this.getFilter(query || {}, options)).forEach((doc: ModelDocument<TSchema>) => res.push(this.document(doc, options)))
@@ -3640,8 +3636,6 @@ export class Model<TSchema extends ModelSchema> {
   /** Update one matching document */
   async update (query: Record<string, any>, options?: ModelContextOptions): Promise<ModelDocument<TSchema>> {
     const collection: MicroCollection = await this.collection!
-    if (!collection)
-      throw new AccessDenied('Database not configured')
     options = {...this.options, ...options}
     if (options?.validate !== false)
       query = this.document(query, options)
@@ -3659,13 +3653,36 @@ export class Model<TSchema extends ModelSchema> {
     return res
   }
 
-  /** Delete one matching document */
-  async delete (query: Query, options?: ModelContextOptions): Promise<void> {
+  /** Update many matching documents */
+  async updateMany (query: Record<string, any>, update: Record<string, any>, options?: ModelContextOptions): Promise<ModelDocument<TSchema>> {
     const collection: MicroCollection = await this.collection!
-    if (!collection)
-      throw new AccessDenied('Database not configured')
-    if (query._id)
-      await collection.deleteOne(this.getFilter(query, {...this.options, ...options}))
+    options = {...this.options, ...options}
+    if (options?.validate !== false)
+      update = this.document(update, options)
+    const unset: Record<string, number> = query.$unset || {}
+    for (const n in update) {
+      if (update[n] === undefined || update[n] === null) {
+        update.$unset = unset
+        unset[n] = 1
+        delete update[n]
+      }
+    }
+    const res = await collection.updateMany(this.getFilter(query, {primaryKey: true, validate: false}), update) as ModelDocument<TSchema>
+    if (!res)
+      throw new NotFound('Document not found')
+    return res
+  }
+
+  /** Delete one matching document */
+  async delete (query: Query, options?: ModelContextOptions): Promise<number> {
+    const collection: MicroCollection = await this.collection!
+    return await collection.deleteOne(this.getFilter(query, {...this.options, ...options}))
+  }
+
+  /** Delete many matching documents */
+  async deleteMany (query: Query, options?: ModelContextOptions): Promise<number> {
+    const collection: MicroCollection = await this.collection!
+    return await collection.deleteMany(this.getFilter(query, {...this.options, ...options}))
   }
 
   /** Microserver middleware */
