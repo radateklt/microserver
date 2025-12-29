@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.10
+ * @version 2.3.11
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -1291,6 +1291,7 @@ export class Router extends EventEmitter {
   }
   
   private _walkTree (item: RouterItem | undefined, req: ServerRequest, res: ServerResponse, next: Function) {
+    // TODO: walk recursively and add to stack all possibilities: /api/user/:id, /api/:last*. set params and paramsList pro stack record
     req.params = {}
     req.paramsList = []
     const rstack: Function[] = []
@@ -1314,7 +1315,7 @@ export class Router extends EventEmitter {
         } else
           done = true
       } else {
-        item = item.last || item.tree[name] || item.param
+        item = item.tree[name] || item.param || item.last
         if (item && item.name) {
           req.params[item.name] = name
           req.paramsList.push(name)
