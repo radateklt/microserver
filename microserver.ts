@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 2.3.9
+ * @version 2.3.10
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -530,7 +530,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
     return this    
   }
 
-  download (path: string, filename?: string): void {
+  file (path: string, filename?: string): void {
     StaticPlugin.serveFile(this.req, this, {
       path: path,
       filename: filename || basename(path),
@@ -1162,7 +1162,7 @@ export class Router extends EventEmitter {
         idx = 5
       }
       if (name === 'json')
-        return (req: ServerRequest, res: ServerResponse) => res.isJson = true
+        return (req: ServerRequest, res: ServerResponse, next: Function) => {res.isJson = true; return next()}
       if (idx >= 0) {
         const v = name.slice(idx + 1)
         const type = name.slice(0, idx)
@@ -2478,6 +2478,8 @@ export interface AuthOptionsInternal extends AuthOptions {
   defaultAcl: { [key: string]: boolean }
   /** Expire time in seconds */
   expire: number
+  /** Use object token instead of user id */
+  objectToken: boolean
   /** Authentication mode */
   mode: 'cookie' | 'token'
   /** Authentication realm for basic authentication */
@@ -2607,7 +2609,7 @@ export class Auth {
     if (usrInfo?.id || usrInfo?._id) {
       const expire = Math.min(34560000, options?.expire || this.options.expire || defaultExpire)
       const expireTime = new Date().getTime() + expire * 1000
-      const token = await this.token((usrInfo?.id || usrInfo?._id), undefined, expire)
+      const token = await this.token(this.options.objectToken ? JSON.stringify(usrInfo) : (usrInfo?.id || usrInfo?._id), undefined, expire)
       
       if (token && this.res && this.req) {
         const oldToken: string | undefined = (this.req as any).tokenId
@@ -2829,7 +2831,7 @@ class AuthPlugin extends Plugin {
       return next()
     }
 
-    const cookie = req.headers.cookie, cookies = cookie ? cookie.split(/;\s+/g) : []
+    const cookie = req.headers.cookie, cookies = cookie ? cookie.split(/;\s*/g) : []
     const sid = cookies.find(s => s.startsWith('token='))
     let token = ''
     if (authorization.startsWith('Bearer '))
@@ -2838,7 +2840,7 @@ class AuthPlugin extends Plugin {
     if (sid)
       token = sid.slice(sid.indexOf('=') + 1)
 
-    if (!token)
+    if (req.query.token)
       token = req.query.token
 
     if (token) {

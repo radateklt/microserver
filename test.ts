@@ -57,7 +57,7 @@ const test: {
       const l = '—'.repeat(16)+'\n', res = process.getActiveResourcesInfo().filter(n => !ignRes.includes(n))
       log(`\x1b[${fail?'33m'+l+'✘':'32m'+l+'✔'} ${count-fail}/${count} ${fail?'FAILED':'SUCCESS'}\x1b[0m`)
       res.length && warn('Active resources:', ...res)
-      res.length && setTimeout(() => process.exit(1), 1000)
+      res.length && setTimeout(() => process.exit(1), 1000).unref()
     }
   }
   return global.test = test
@@ -529,6 +529,7 @@ test('Auth', async () => {
     expire: 10,
     cache: {},
     cacheCleanup: 0,
+    objectToken: false,
     mode: 'token',
     realm: 'test',
     redirect: '/'

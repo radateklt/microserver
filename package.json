@@ -1,6 +1,6 @@
 {
   "name": "@radatek/microserver",
-  "version": "2.3.9",
+  "version": "2.3.10",
   "description": "HTTP MicroServer",
   "author": "Darius Kisonas",
   "license": "MIT",
@@ -23,6 +23,6 @@
     "publish": "pnpm publish dist --access public"
   },
   "devDependencies": {
-    "@types/node": "^22.19.1"
+    "@types/node": "^25.0.3"
   }
 }

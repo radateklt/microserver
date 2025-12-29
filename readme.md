@@ -158,15 +158,17 @@ const UserModel = Model.define({
 
 class UserController extends Controller<typeof UserModel> {
   static model = UserModel
+  static name = 'user'
 
-  static 'acl:get' = 'user'
-  get(id: string) { // same as 'GET /'
-    this.model.findOne({id})
+  static 'acl:get' = 'user/get'
+  async get(id: string) { // same as 'GET user'
+    return {user: await this.model.findOne({id})}
   }
 
   static 'acl:insert' = 'user/insert'
-  insert() { // same as 'POST /'
-    this.model.insert(this.req.body)
+  async insert() { // same as 'POST user'
+    await this.model.insert(this.req.body)
+    return {}
   }
 }
 
