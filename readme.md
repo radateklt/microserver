@@ -30,7 +30,7 @@ Features:
 Simple router:
 
 ```ts
-import { MicroServer, AccessDenied } from '@radatek/microserver'
+import { MicroServer, AccessDenied, StandardPlugins, StaticPlugin } from '@radatek/microserver'
 
 const server = new MicroServer({
   listen: 8080,
@@ -42,6 +42,7 @@ const server = new MicroServer({
     }
   }
 })
+server.use(StandardPlugins)
 server.use('GET /api/hello/:id',
   (req: ServerRequset, res: ServerResponse) =>
     ({message:'Hello ' + req.params.id + '!'}))
@@ -54,7 +55,7 @@ server.use('POST /api/login',
 server.use('GET /api/protected', 'acl:auth',
   (req: ServerRequset, res: ServerResponse) =>
     ({message:'Secret resource'}))
-server.use('static', {root:'public'})
+server.use(StaticPlugin, {root:'public'})
 ```
 
 Using data schema:
@@ -121,6 +122,7 @@ const server = new MicroServer({
     }
   }
 })
+server.use(StandardPlugins)
 
 new MicroCollectionStore('data') // initialize simple file store for models
 //new MicroCollectionStore() // initialize simple memory store for models

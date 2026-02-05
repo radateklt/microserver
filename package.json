@@ -1,6 +1,6 @@
 {
   "name": "@radatek/microserver",
-  "version": "2.3.11",
+  "version": "3.0.0a",
   "description": "HTTP MicroServer",
   "author": "Darius Kisonas",
   "license": "MIT",
@@ -14,15 +14,15 @@
   "main": "microserver.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/radateklt/microserver.git"
+    "url": "https://github.com/radateklt/microserver.git"
   },
   "scripts": {
     "prepublishOnly": "pnpm build && echo 'call: pnpm run publish' && exit 1",
-    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2021 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g;s/export \\{\\};//g' dist/microserver.d.ts; cp package.json dist/package.json && sed -Ei ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"microserver.js\",\\n  \"module\": \"microserver.js\",\\n  \"types\": \"microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' dist/package.json",
+    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g;s/export \\{\\};//g' dist/microserver.d.ts; cp package.json dist/package.json && sed -Ei ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"microserver.js\",\\n  \"module\": \"microserver.js\",\\n  \"types\": \"microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' dist/package.json",
     "test": "node test.ts",
     "publish": "pnpm publish dist --access public"
   },
   "devDependencies": {
-    "@types/node": "^25.0.3"
+    "@types/node": "^25.2.0"
   }
 }

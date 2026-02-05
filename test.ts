@@ -1,7 +1,7 @@
 import assert from 'assert'
 import fs from 'fs/promises'
 import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin, MicroCollectionStore, type UserInfo } from './microserver.ts'
-type Routes = import('./microserver.ts').Routes
+import { StandardPlugins, StaticPlugin } from './microserver.ts'
 
 const test: {
   (name: string, fn?: Function): void
@@ -100,12 +100,12 @@ test('Start server', async () => {
       }
     }
   })
-  await server.waitReady()
+  server.use(StandardPlugins)
   let listen = false
   server.on('listen', () => listen = true)
   await server.waitReady()
   await new Promise((resolve: Function) => server.on('ready', () => resolve()))
-  assert(server.servers.size === 1, 'Server not ready')
+  assert(server.servers?.size === 1, 'Server not ready')
   assert(listen, 'Event listen not fired')
 })
 test('Server async use', async () => {
@@ -117,6 +117,7 @@ test('Server async use', async () => {
       step++
     else
       failed(new Error('Failed step 0!=' + step))
+    return undefined as any as () => {}
   })())
   class TestPlugin extends Plugin {
     name: string = 'TestPlugin'
@@ -133,13 +134,14 @@ test('Server async use', async () => {
         step++
       else
         failed(new Error('Failed step 2!=' + step))
-      return {} as Routes
-    }    
+      return {}
+    }
   }
   await server.use(TestPlugin)
   await server.use((async () => {
     done()
     failed = () => {}
+    return {}
   })())
   setTimeout(() => failed(new Error('Timeout')), 500)
   await p
@@ -164,7 +166,7 @@ test('CORS', async () => {
 })
   
 test('Static', async () => {
-  server.use('static', { root: './tmp/public' })
+  server.use(StaticPlugin, { root: './tmp/public' })
   await fs.writeFile('./tmp/public/index.html', '<html><body><h1>Hello World</h1></body></html>')
   await fs.writeFile('./tmp/public/index.dat', 'internal')
   await fs.writeFile('./tmp/index.txt', 'internal')
@@ -191,7 +193,7 @@ test('Static', async () => {
 })
 
 test('Routes: stack', async () => {
-  assert.equal((server.router as any)._stack.length, 1, 'Invalid stack')
+  assert.equal((server as any)._stack.length, 1, 'Invalid stack')
   server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
     if (req.query.test)
       return {test: req.query.test, body: req.body}
@@ -203,8 +205,8 @@ test('Routes: stack', async () => {
 })
 
 test('Routes: GET', async () => {
-  server.router.clear()
-  assert.equal((server.router as any)._tree.GET, undefined, 'Invalid routes')
+  server.clear()
+  assert.equal((server as any)._routesTree.GET, undefined, 'Invalid routes')
   server.use('GET /test1', (req: ServerRequest, res: ServerResponse) => {
     if (req.query.a)
       return res.jsonSuccess({ a: req.query.a })
@@ -216,8 +218,8 @@ test('Routes: GET', async () => {
       return Promise.resolve({ d: req.query.d })
     return 'done'
   })
-  test('stack', () => assert.equal((server.router as any)._stack.length, 0))
-  test('tree', () => assert.equal((server.router as any)._tree.GET?.tree?.test1?.next?.length, 1))
+  test('stack', () => assert.equal((server as any)._stack.length, 0))
+  test('tree', () => assert.equal((server as any)._tree.GET?.tree?.test1?.next?.length, 1))
   test('jsonSuccess', async() => assert.deepEqual(await GET('/test1?a=test-a'), {success: true, a: 'test-a'}))
   test('object', async() => assert.deepEqual(await GET('/test1?b=test-b'), { success: true, b: 'test-b' }))
   test('json', async() => assert.deepEqual(await GET('/test1?c=test-c'), { c: 'test-c' }))
@@ -226,17 +228,17 @@ test('Routes: GET', async () => {
 })
 
 test('Routes: POST', async () => {
-  server.router.clear()
-  assert.equal((server.router as any)._tree.POST, undefined, 'Invalid routes')
+  server.clear()
+  assert.equal((server as any)._routesTree, undefined, 'Invalid routes')
   server.use('POST /test2/:id', (req: ServerRequest, res: ServerResponse) => {
     return {data: req.body, id: req.params.id}
   })
   server.use('POST /test3/:id2*', (req: ServerRequest, res: ServerResponse) => {
     throw new Error('Access denied')
   })
-  test('stack', () => assert.equal((server.router as any)._stack.length, 0))
-  test('tree test2', () => assert.equal((server.router as any)._tree.POST?.tree?.test2?.param?.next?.length, 1))
-  test('tree test3', () => assert.equal((server.router as any)._tree.POST?.tree?.test3?.last?.next?.length, 1))
+  test('stack', () => assert.equal((server as any)._stack.length, 0))
+  test('tree test2', () => assert.equal((server as any)._routesTree.POST?.tree?.test2?.param?.next?.length, 1))
+  test('tree test3', () => assert.equal((server as any)._routesTree.POST?.tree?.test3?.last?.next?.length, 1))
   test('json Not found', async() => assert.deepEqual((await POST('/test2', {a: 'test2-a'})), {success:false, error: 'Not found'}))
   test('json', async() => assert.deepEqual((await POST('/test2/prm', {b: 'test2-b'})), {success: true, data: {b: 'test2-b'}, id: 'prm'}))
   test('json exception', async() => assert.deepEqual((await POST('/test3/prm/error', {b: 'test2-b'})), {success: false, error: 'Access denied'}))
@@ -244,38 +246,37 @@ test('Routes: POST', async () => {
 })
 
 test('Routes: path', async () => {
-  const router = server.router as any
-  server.router.clear()
-  assert.equal(router._tree.GET, undefined, 'Invalid routes')
+  server.clear()
+  assert.equal((server as any)._routesTree.GET, undefined, 'Invalid routes')
 
   test('any param', async () => {
     await server.use('/test2/:id', () => {})
-    assert(router._tree['*']?.tree?.test2?.param, 'invalid route /test2/:id')
+    assert((server as any)._routesTree['*']?.tree?.test2?.param, 'invalid route /test2/:id')
   })
   test('GET param', async () => {
     await server.use('GET /test3/:id', () => {})
-    assert(router._tree.GET?.tree?.test3?.param, 'invalid route /test3/:id')
+    assert((server as any)._routesTree.GET?.tree?.test3?.param, 'invalid route /test3/:id')
   })
   test('GET object', async () => {
     await server.use({'GET /test4/p1': () => {}, 'GET /test4/p2': () => {}})
-    assert(router._tree.GET?.tree?.test4?.tree?.p1, 'invalid route /test4/p1')
-    assert(router._tree.GET?.tree?.test4?.tree?.p2, 'invalid route /test4/p2')
+    assert((server as any)._routesTree.GET?.tree?.test4?.tree?.p1, 'invalid route /test4/p1')
+    assert((server as any)._routesTree.GET?.tree?.test4?.tree?.p2, 'invalid route /test4/p2')
   })
   test('GET url object', async () => {
     await server.use('/test5', {'GET /p1': () => {}, 'GET /p2': () => {}})
-    assert(router._tree.GET?.tree?.test5?.tree?.p1, 'invalid route /test5/p1')
-    assert(router._tree.GET?.tree?.test5?.tree?.p2, 'invalid route /test5/p2')
+    assert((server as any)._routesTree.GET?.tree?.test5?.tree?.p1, 'invalid route /test5/p1')
+    assert((server as any)._routesTree.GET?.tree?.test5?.tree?.p2, 'invalid route /test5/p2')
   })
   test('GET url array', async () => {
     await server.use('/test6', [ ['GET /p1', () => {}], ['GET /p2', () => {}]])
-    assert(router._tree.GET?.tree?.test6?.tree?.p1, 'invalid route /test5/p1')
-    assert(router._tree.GET?.tree?.test6?.tree?.p2, 'invalid route /test5/p2')
+    assert((server as any)._routesTree.GET?.tree?.test6?.tree?.p1, 'invalid route /test5/p1')
+    assert((server as any)._routesTree.GET?.tree?.test6?.tree?.p2, 'invalid route /test5/p2')
   })
 })
 
 test('Middleware', async () => {
   test('priority 1', async () => {
-    server.router.clear()
+    server.clear()
     const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
       res.send('mid1')
     }
@@ -287,7 +288,7 @@ test('Middleware', async () => {
     assert.equal(await GET('/test'), 'mid1') 
   })
   test('priority 2', async () => {
-    server.router.clear()
+    server.clear()
     const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
       res.send('mid1')
     }
@@ -301,15 +302,21 @@ test('Middleware', async () => {
     assert.equal(await GET('/test'), 'mid2') 
   })
   test('plugin', async () => {
-    server.router.clear()
-    class TestPlugin extends Plugin {
-      name: string = 'test'      
+    server.clear()
+    class TestPlugin1 extends Plugin {
+      name: string = 'test1'
     }
-    await server.use(TestPlugin)
-    assert(server.router.plugins.test)
+    class TestPlugin2 extends Plugin {
+      name: string = 'test2'
+      handler(req: ServerRequest, res: ServerResponse, next: Function) {next()}
+    }
+    await server.use(TestPlugin1)
+    assert(!server.getPlugin('test1'))
+    await server.use(TestPlugin2)
+    assert(server.getPlugin('test2'))
     let failed = false
     try {
-      await server.use(new TestPlugin(server.router))
+      await server.use(new TestPlugin1())
     } catch {
       failed = true
     }
@@ -318,7 +325,7 @@ test('Middleware', async () => {
 })
 
 test('Controller', async () => {
-  server.router.clear()
+  server.clear()
   const MyModel = new Model({
     name: 'string',
     value: 'string',
@@ -377,7 +384,7 @@ test('Controller', async () => {
     await server.use('/api', TestController)
     await server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
       req.user = {id: 'test', acl: {get: true, insert: false, update: true, all: false}}
-      new Auth(req.router!.auth!.options, req, res)
+      new Auth(req.server!.auth!.options, req, res)
       next()
     })  
   })
@@ -465,7 +472,7 @@ test('Model invalid', async () => {
 })
 
 test('Model store', async () => {
-  server.router.clear()
+  server.clear()
   const model = new Model({_id: 'objectid', name: String}, {name: 'test', collection: new MicroCollection()})
   server.get('/test', model)
   server.get('/test/:id', model)
@@ -516,7 +523,7 @@ test('FileStore', async () => {
 
 test('Stop server', async () => {
   await server.close()
-  assert(server.servers.size === 0, 'Server not closed')
+  assert(server.servers?.size === 0, 'Server not closed')
 
   await new Promise(resolve => setTimeout(resolve, 10)) // closing listening port needs some time
 })
@@ -686,19 +693,19 @@ test('Server Auth', async () => {
     assert.equal((await userProfile.findOne({_id: 'test2'}))?.name, undefined)
   })
   test('Cache reset', async () => {
-    const cache = (server.router.auth as any).options.cache
+    const cache = (server.auth as any).options.cache
     for (const key in cache)
       delete cache[key]
     assert.equal((await GET('/profile', optionsAdmin))?.user?._id, 'admin')
   })
   test('Expire', async () => {
-    const token = await server.router.auth?.token('test', 'secret', 0.001)
+    const token = await server.auth?.token('test', 'secret', 0.001)
     assert(token)
     await new Promise(resolve => setTimeout(resolve, 1))
     assert.equal((await GET('/profile', { response: true, headers: {cookie: 'token=' + token}}))?.status, 403)
   })
   test('Revalidate', async () => {
-    const token = await server.router.auth?.token('test', 'secret', 5)
+    const token = await server.auth?.token('test', 'secret', 5)
     optionsTest.headers.cookie = 'token=' + token
     assert.equal((await GET('/profile', optionsTest))?.user?._id, 'test')
   })
