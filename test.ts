@@ -1,7 +1,7 @@
 import assert from 'assert'
 import fs from 'fs/promises'
 import { MicroServer, MicroCollection, Model, Controller, Auth, FileStore, ServerRequest, ServerResponse, Plugin, MicroCollectionStore, type UserInfo } from './microserver.ts'
-import { StandardPlugins, StaticPlugin } from './microserver.ts'
+import { StandardPlugins, StaticFilesPlugin } from './microserver.ts'
 
 const test: {
   (name: string, fn?: Function): void
@@ -121,19 +121,12 @@ test('Server async use', async () => {
   })())
   class TestPlugin extends Plugin {
     name: string = 'TestPlugin'
-    async initialise() {
-      await timeout(4)
+    async routes() {
+      await timeout(2)
       if (step === 1)
         step++
       else
         failed(new Error('Failed step 1!=' + step))
-    }
-    async routes() {
-      await timeout(2)
-      if (step === 2)
-        step++
-      else
-        failed(new Error('Failed step 2!=' + step))
       return {}
     }
   }
@@ -145,7 +138,7 @@ test('Server async use', async () => {
   })())
   setTimeout(() => failed(new Error('Timeout')), 500)
   await p
-  assert.equal(step, 3)
+  assert.equal(step, 2)
 })
 test('CORS', async () => {
   test('OPTIONS', async () => {
@@ -166,7 +159,7 @@ test('CORS', async () => {
 })
   
 test('Static', async () => {
-  server.use(StaticPlugin, { root: './tmp/public' })
+  server.use(StaticFilesPlugin, { root: './tmp/public' })
   await fs.writeFile('./tmp/public/index.html', '<html><body><h1>Hello World</h1></body></html>')
   await fs.writeFile('./tmp/public/index.dat', 'internal')
   await fs.writeFile('./tmp/index.txt', 'internal')
@@ -193,12 +186,13 @@ test('Static', async () => {
 })
 
 test('Routes: stack', async () => {
-  assert.equal((server as any)._stack.length, 1, 'Invalid stack')
+  const stackLength = (server as any)._stack.length
   server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
     if (req.query.test)
       return {test: req.query.test, body: req.body}
     next()
   })
+  assert.equal((server as any)._stack.length, stackLength + 1, 'Invalid stack')
   test('GET', async() => assert.deepEqual(await GET('/test1?test=test-a'), {success: true, test: 'test-a', body: {}}))
   test('POST', async() => assert.deepEqual(await POST('/test2?test=test-b', {test2: 'test-b'}), {success: true, test: 'test-b', body: {test2: 'test-b'}}))
   test('Not found', async() => assert.equal(await GET('/test2'), 'Not found'))
@@ -206,7 +200,7 @@ test('Routes: stack', async () => {
 
 test('Routes: GET', async () => {
   server.clear()
-  assert.equal((server as any)._routesTree.GET, undefined, 'Invalid routes')
+  assert.equal((server as any)._router._tree.GET, undefined, 'Invalid routes')
   server.use('GET /test1', (req: ServerRequest, res: ServerResponse) => {
     if (req.query.a)
       return res.jsonSuccess({ a: req.query.a })
@@ -218,8 +212,8 @@ test('Routes: GET', async () => {
       return Promise.resolve({ d: req.query.d })
     return 'done'
   })
-  test('stack', () => assert.equal((server as any)._stack.length, 0))
-  test('tree', () => assert.equal((server as any)._tree.GET?.tree?.test1?.next?.length, 1))
+  test('stack', () => assert.equal((server as any)._stack.length, 1))
+  test('tree', () => assert.equal((server as any)._router._tree.GET?._next?.test1?._last?.length, 1))
   test('jsonSuccess', async() => assert.deepEqual(await GET('/test1?a=test-a'), {success: true, a: 'test-a'}))
   test('object', async() => assert.deepEqual(await GET('/test1?b=test-b'), { success: true, b: 'test-b' }))
   test('json', async() => assert.deepEqual(await GET('/test1?c=test-c'), { c: 'test-c' }))
@@ -234,72 +228,83 @@ test('Routes: POST', async () => {
     return {data: req.body, id: req.params.id}
   })
   server.use('POST /test3/:id2*', (req: ServerRequest, res: ServerResponse) => {
+    res.isJson = true
     throw new Error('Access denied')
   })
-  test('stack', () => assert.equal((server as any)._stack.length, 0))
-  test('tree test2', () => assert.equal((server as any)._routesTree.POST?.tree?.test2?.param?.next?.length, 1))
-  test('tree test3', () => assert.equal((server as any)._routesTree.POST?.tree?.test3?.last?.next?.length, 1))
-  test('json Not found', async() => assert.deepEqual((await POST('/test2', {a: 'test2-a'})), {success:false, error: 'Not found'}))
-  test('json', async() => assert.deepEqual((await POST('/test2/prm', {b: 'test2-b'})), {success: true, data: {b: 'test2-b'}, id: 'prm'}))
+  test('stack', () => assert.equal((server as any)._stack.length, 1))
+  test('tree test2', () => assert.equal((server as any)._router._tree.POST?._next?.test2?._withParam?._last?.length, 1))
+  test('tree test3', () => assert.equal((server as any)._router._tree.POST?._next?.test3?._withParam?._last?.length, 1))
+  test('json Not found', async() => assert.deepEqual((await POST('/test2', {a: 'test2-a'})), 'Not found'))
+  test('json', async() => assert.deepEqual((await POST('/test2/prm', {b: 'test2-b'})), {success: true, id: 'prm'}))
   test('json exception', async() => assert.deepEqual((await POST('/test3/prm/error', {b: 'test2-b'})), {success: false, error: 'Access denied'}))
   test('GET Not found', async() => assert.equal(await GET('/test2'), 'Not found'))
 })
 
 test('Routes: path', async () => {
   server.clear()
-  assert.equal((server as any)._routesTree.GET, undefined, 'Invalid routes')
+  assert.equal((server as any)._router._tree.GET, undefined, 'Invalid routes')
 
   test('any param', async () => {
     await server.use('/test2/:id', () => {})
-    assert((server as any)._routesTree['*']?.tree?.test2?.param, 'invalid route /test2/:id')
+    assert.equal((server as any)._router._tree['*']?._next?.test2?._withParam?._paramName, 'id', 'invalid route /test2/:id')
   })
   test('GET param', async () => {
     await server.use('GET /test3/:id', () => {})
-    assert((server as any)._routesTree.GET?.tree?.test3?.param, 'invalid route /test3/:id')
+    assert((server as any)._router._tree.GET?._next?.test3?._withParam, 'invalid route /test3/:id')
   })
   test('GET object', async () => {
     await server.use({'GET /test4/p1': () => {}, 'GET /test4/p2': () => {}})
-    assert((server as any)._routesTree.GET?.tree?.test4?.tree?.p1, 'invalid route /test4/p1')
-    assert((server as any)._routesTree.GET?.tree?.test4?.tree?.p2, 'invalid route /test4/p2')
+    assert((server as any)._router._tree.GET?._next?.test4?._next?.p1, 'invalid route /test4/p1')
+    assert((server as any)._router._tree.GET?._next?.test4?._next?.p2, 'invalid route /test4/p2')
   })
   test('GET url object', async () => {
     await server.use('/test5', {'GET /p1': () => {}, 'GET /p2': () => {}})
-    assert((server as any)._routesTree.GET?.tree?.test5?.tree?.p1, 'invalid route /test5/p1')
-    assert((server as any)._routesTree.GET?.tree?.test5?.tree?.p2, 'invalid route /test5/p2')
+    assert((server as any)._router._tree.GET?._next?.test5?._next?.p1, 'invalid route /test5/p1')
+    assert((server as any)._router._tree.GET?._next?.test5?._next?.p2, 'invalid route /test5/p2')
   })
   test('GET url array', async () => {
     await server.use('/test6', [ ['GET /p1', () => {}], ['GET /p2', () => {}]])
-    assert((server as any)._routesTree.GET?.tree?.test6?.tree?.p1, 'invalid route /test5/p1')
-    assert((server as any)._routesTree.GET?.tree?.test6?.tree?.p2, 'invalid route /test5/p2')
+    assert((server as any)._router._tree.GET?._next?.test6?._next?.p1, 'invalid route /test5/p1')
+    assert((server as any)._router._tree.GET?._next?.test6?._next?.p2, 'invalid route /test5/p2')
   })
 })
 
+test('Routes: hook', async () => {
+  server.clear()
+  server.use('GET /test1/test2', (req) => req.params.hook1 || req.params.hook || 'test')
+  assert.equal(await GET('/test1/test2'), 'test')
+  server.hook('/test1', 'hook=1')
+  assert.equal(await GET('/test1/test2'), '1', 'Invalid hook 1')
+  server.hook('GET /test1', 'hook=2')
+  assert.equal(await GET('/test1/test2'), '2', 'Invalid hook 2')
+  server.hook('GET /test1/test2', 'hook=3')
+  assert.equal(await GET('/test1/test2'), '3', 'Invalid hook 3')
+  server.hook('/test1/test2', 'hook=4')
+  assert.equal(await GET('/test1/test2'), '3', 'Invalid hook 4')
+  server.hook('/', 'hook1=5')
+  assert.equal(await GET('/test1/test2'), '5', 'Invalid hook 5')
+})
+
 test('Middleware', async () => {
-  test('priority 1', async () => {
+  test('priority', async () => {
     server.clear()
-    const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
-      res.send('mid1')
-    }
     const mid2 = (req: ServerRequest, res: ServerResponse, next: Function) => {
-      res.send('mid2')
-    }
-    await server.use(mid1)
-    await server.use(mid2)
-    assert.equal(await GET('/test'), 'mid1') 
-  })
-  test('priority 2', async () => {
-    server.clear()
-    const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
-      res.send('mid1')
-    }
-    mid1.priority = 1
-    const mid2 = (req: ServerRequest, res: ServerResponse, next: Function) => {
-      res.send('mid2')
+      if (req.query.test)
+        return 'prio2'
+      next()
     }
     mid2.priority = 2
-    await server.use(mid1)
-    await server.use(mid2)
-    assert.equal(await GET('/test'), 'mid2') 
+    server.use(mid2)
+    assert.equal(await GET('/test1?test=1'), 'prio2', 'Invalid priority 1')
+    const mid1 = (req: ServerRequest, res: ServerResponse, next: Function) => {
+      if (req.query.test === '1')
+        return 'prio1'
+      next()
+    }
+    mid1.priority = 1
+    server.use(mid1)
+    assert.equal(await GET('/test1?test=1'), 'prio1', 'Invalid priority 2')
+    assert.equal(await GET('/test1?test=2'), 'prio2', 'Invalid priority 3')
   })
   test('plugin', async () => {
     server.clear()
@@ -311,21 +316,18 @@ test('Middleware', async () => {
       handler(req: ServerRequest, res: ServerResponse, next: Function) {next()}
     }
     await server.use(TestPlugin1)
-    assert(!server.getPlugin('test1'))
+    assert(!server.getPlugin('test1'), 'Invalid plugin 1')
     await server.use(TestPlugin2)
-    assert(server.getPlugin('test2'))
+    assert(server.getPlugin('test2'), 'Invalid plugin 2')
     let failed = false
-    try {
-      await server.use(new TestPlugin1())
-    } catch {
-      failed = true
-    }
-    assert(failed)
+    await server.use(new TestPlugin2()).catch(() => failed = true)
+    assert(failed, 'Invalid plugin 3')
   })
 })
 
 test('Controller', async () => {
   server.clear()
+  server.use(StandardPlugins)
   const MyModel = new Model({
     name: 'string',
     value: 'string',
@@ -373,13 +375,13 @@ test('Controller', async () => {
   }
   const routes = TestController.routes()
   test('POST /login', () => assert(routes.find(o => o[0] === 'POST /login')))
-  test('POST /login2', () => assert(routes.find(o => o[0] === 'POST /login2' && o[1] === 'user:test')))
-  test('POST /login3', () => assert(routes.find(o => o[0] === 'POST /login3' && o[1] === 'acl:test2')))
-  test('insert', () => assert(routes.find(o => o[0] === 'POST /:id' && o[1] === 'acl:insert')))
-  test('update/admin/user', () => assert(routes.find(o => o[0] === 'PUT /admin/user/:id' && o[1] === 'acl:update')))
-  test('update', () => assert(routes.find(o => o[0] === 'PUT /:id/:id1' && o[1] === 'acl:update')))
-  test('get', () => assert(routes.find(o => o[0] === 'GET /:id/:id1' && o[1] === 'acl:get')))
-  test('all', () => assert(routes.find(o => o[0] === 'GET /:id' && o[1] === 'acl:all')))
+  test('POST /login2', () => assert(routes.find(o => o[0] === 'POST /login2' && o[2] === 'user:test')))
+  test('POST /login3', () => assert(routes.find(o => o[0] === 'POST /login3' && o[2] === 'acl:test2')))
+  test('insert', () => assert(routes.find(o => o[0] === 'POST /:id' && o[2] === 'acl:insert')))
+  test('update/admin/user', () => assert(routes.find(o => o[0] === 'PUT /admin/user/:id' && o[2] === 'acl:update')))
+  test('update', () => assert(routes.find(o => o[0] === 'PUT /:id/:id1' && o[2] === 'acl:update')))
+  test('get', () => assert(routes.find(o => o[0] === 'GET /:id/:id1' && o[2] === 'acl:get')))
+  test('all', () => assert(routes.find(o => o[0] === 'GET /:id' && o[2] === 'acl:all')))
   test('router', async () => {
     await server.use('/api', TestController)
     await server.use((req: ServerRequest, res: ServerResponse, next: Function) => {
@@ -473,6 +475,7 @@ test('Model invalid', async () => {
 
 test('Model store', async () => {
   server.clear()
+  server.use(StandardPlugins)
   const model = new Model({_id: 'objectid', name: String}, {name: 'test', collection: new MicroCollection()})
   server.get('/test', model)
   server.get('/test/:id', model)
@@ -611,6 +614,7 @@ test('Server Auth', async () => {
       users: (user, password) => password ? userProfile.findOne({_id: user, password }) : userProfile.findOne({_id: user}) as Promise<any>
     }
   })
+  server.use(StandardPlugins)
 
   await userProfile.insert({_id: 'admin', name: 'admin', password: 'secret', group: 'admins', acl: {'user/*': true}})
   await userProfile.insert({_id: 'test', name: 'Test', password: 'secret'})
@@ -619,6 +623,7 @@ test('Server Auth', async () => {
     const user = await req.auth?.login(req.body?.user, req.body?.password)
     return user ? { user } : new Error('Access denied')
   })
+  server.hook('/admin', 'response:json')
   server.use('GET /profile', 'acl:auth', (req: ServerRequest) => ({ user: req.user }))
   server.use('GET /admin/users', 'group:admins', userProfile)
   server.use('GET /admin/user/:id', 'acl:user/get', userProfile)

@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.0a
+ * @version 3.0.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -304,6 +304,12 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   
   /** Sets Content-Type acording to data and sends response */
   send (data: string | Buffer | Error | Readable | object = ''): void {
+    if (this.headersSent)
+      return
+    if (!this.req.complete) {
+      this.req.pause()
+      this.setHeader('Connection', 'close')
+    }
     if (data instanceof Readable)
       return (data.pipe(this, {end: true}), void 0)
     if (!this.getHeader('Content-Type') && !(data instanceof Buffer)) {
@@ -344,7 +350,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
     if (typeof error === 'number')
       error = http.STATUS_CODES[error] || 'Error'
     if (error instanceof Error)
-      return this.json(error)
+      return this.error(error)
     this.json(typeof error === 'string' ? { success: false, error } : { success: false, ...error })
   }
   
@@ -352,7 +358,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   jsonSuccess (data?: object | string): void {
     this.isJson = true
     if (data instanceof Error)
-      return this.json(data)
+      return this.error(data)
     this.json(typeof data === 'string' ? { success: true, message: data } : { success: true, ...data })
   }
 
@@ -386,23 +392,52 @@ export class ServerResponse<T = any> extends http.ServerResponse {
 }
 // #endregion ServerRequest/ServerResponse
 
-
 type RouteURL = `${Uppercase<string>} /${string}`|`/${string}`
 type StringMiddleware = `response:json`|`response:html`|`response:end`|`redirect:${string}`|`error:${number}`|`param:${string}=${string}`|`acl:${string}`|`user:${string}`|`group:${string}`|`model:${string}`|`${string}=${string}`
 type RoutesMiddleware = Middleware|Plugin|StringMiddleware|Promise<Middleware|Plugin>
 type RoutesList = [RouteURL, ...Array<RoutesMiddleware>]|[RouteURL, ControllerClass|Promise<ControllerClass>]
 type RoutesSet = Array<RoutesList|ControllerClass|Promise<ControllerClass>>|Record<RouteURL,RoutesList|ControllerClass|Promise<ControllerClass>|Middleware>
 
+//** MicroServer configuration */
+export interface MicroServerConfig extends ListenConfig {
+  /** Auth options */
+  auth?: AuthOptions
+  /** routes to add */
+  routes?: RoutesSet
+  /** Static file options */
+  static?: StaticFilesOptions
+  /** max body size (default: 5MB) */
+  body?: BodyOptions
+  /** allowed HTTP methods */
+  methods?: string
+  /** trust proxy */
+  trustproxy?: string[]
+  /** cors options */
+  cors?: string | CorsOptions | boolean
+  /** upload dir */
+  upload?: UploadOptions
+  /** websocket options */
+  websocket?: WebSocketOptions
+  /** extra options for plugins */
+  [key: string]: any
+}
+
+interface MicroServerEvents {
+  ready: () => void
+  close: () => void
+  listen: (port: number, address: string, server: http.Server) => void
+  error: (err: Error) => void
+  [key: `plugin:${string}`]: (plugin: Plugin) => void
+}
+
 /** Lighweight HTTP server */
 export class MicroServer extends EventEmitter {
   public config: MicroServerConfig
   public auth?: Auth
-  //public plugins: Record<string, Plugin> = {}
 
   private _stack: Middleware[] = []
-  private _stackAfter: Middleware[] = []
-  private _routesTree: Record<string, RouterItem> = {}
-  _worker: Worker = new Worker()
+  private _router: RouterPlugin = new RouterPlugin()
+  private _worker: Worker = new Worker()
   
   /** all sockets */
   public sockets: Set<net.Socket> | undefined
@@ -413,6 +448,7 @@ export class MicroServer extends EventEmitter {
   constructor (config?: MicroServerConfig) {
     super()
     this.config = config || {}
+    this.use(this._router)
     if (config) {
       if (this.config.routes)
         this.use(this.config.routes)
@@ -646,166 +682,29 @@ export class MicroServer extends EventEmitter {
       req._isReady = deferPromise((err) => {
         req._isReady = undefined
         if (err) {
-          req.pause()
-          if (!res.headersSent) {
-            res.setHeader('Connection', 'close')
+          if (!res.headersSent)
             res.error('statusCode' in err ? err.statusCode as number : 400)
-          }
-        } else
-          res.removeHeader('Connection')
+        }
       })
     }
-
-    this.handlerRouter(req, res, () => this.handlerLast(req, res))
+    this._router.walk(this._stack, req, res, () => res.error(404))
+    //this.handlerRouter(req, res, () => this.handlerLast(req, res))
   }
-
-  /** Handler */
-  handlerRouter (req: ServerRequest, res: ServerResponse, next: Function) {
-    //if (method === 'WEBSOCKET')
-    //  return this._walkTree(this._routesTree[method], req, res, next)
-    const nextAfter: Function = next
-    next = () => this._walkStack(this._stackAfter, req, res, nextAfter)
-    const walkTree = (method: string) => this._walkTree(this._routesTree[method], req, res, next)
-    const walk = req.method === 'WEBSOCKET' ?
-      () => { !walkTree(req.method!) && next() } :
-      () => { !walkTree(req.method || 'GET') && !walkTree('*') && next() }
-    req.rewrite = (url: string) => {
-      if (req.originalUrl)
-        res.error(508)
-      req.updateUrl(url)
-      walk()
-    }
-    this._walkStack(this._stack, req, res, walk)
-  }
-
+  
   /** Last request handler */
   handlerLast (req: ServerRequest, res: ServerResponse, next?: Function) {
-    if (res.headersSent)
+    if (res.headersSent || res.closed)
       return
     if (!next)
       next = () => res.error(404)
     return next()
   }
 
-  private _walkStack (rstack: Function[], req: ServerRequest, res: ServerResponse, next: Function) {
-    let rnexti = 0
-    const sendData = (data: any) => {
-      if (!res.headersSent && data !== undefined) {
-        if ((data === null || typeof data === 'string') && !res.isJson)
-          return res.send(data)
-        if (typeof data === 'object' && 
-          (data instanceof Buffer || data instanceof Readable || (data instanceof Error && !res.isJson)))
-          return res.send(data)
-        return res.jsonSuccess(data)
-      }
-    }
-    const rnext = () => {
-      const cb = rstack[rnexti++]
-      if (cb) {
-        try {
-          const p = cb(req, res, rnext)
-          if (p instanceof Promise)
-            p.catch(e => e).then(sendData)
-          else
-            sendData(p)
-        } catch (e) {
-          sendData(e)
-        }
-      } else
-        return next()
-    }
-    return rnext()
-  }
-  
-  private _walkTree (item: RouterItem | undefined, req: ServerRequest, res: ServerResponse, next: Function) {
-    // TODO: walk recursively and add to stack all possibilities: /api/user/:id, /api/:last*. set params and paramsList pro stack record
-    req.params = {}
-    req.paramsList = []
-    const rstack: Function[] = []
-    const reg = /\/([^/]*)/g
-    let m: RegExpExecArray | null
-    let lastItem, done
-    while (m = reg.exec(req.pathname)) {
-      const name = m[1]
-      if (!item || done) {
-        item = undefined
-        break
-      }
-      if (lastItem !== item) {
-        lastItem = item
-        item.hook?.forEach((hook: Function) => rstack.push(hook.bind(item)))
-      }
-      if (!item.tree) { // last
-        if (item.name) {
-          req.params[item.name] += '/' + name
-          req.paramsList[req.paramsList.length - 1] = req.params[item.name]
-        } else
-          done = true
-      } else {
-        item = item.tree[name] || item.param || item.last
-        if (item && item.name) {
-          req.params[item.name] = name
-          req.paramsList.push(name)
-        }
-      }
-    }
-    if (lastItem !== item)
-      item?.hook?.forEach((hook: Function) => rstack.push(hook.bind(item)))
-    item?.next?.forEach((cb: Function) => rstack.push(cb))
-    if (!rstack.length)
-      return
-    this._walkStack(rstack, req, res, next)
-    return true
-  }  
-
-  private _add (method: string, url: string, key: 'next' | 'hook', middlewares: any[]) {
-    if (key === 'next')
-      this.emit('route', {
-        method,
-        url,
-        middlewares
-      })
-    middlewares = middlewares.map(m => this._bind(m))
-
-    let item: RouterItem = this._routesTree[method]
-    if (!item)
-      item = this._routesTree[method] = { tree: {} }
-    if (!url.startsWith('/')) {
-      if (method === '*' && url === '') {
-        this._stack.push(...middlewares)
-        return this
-      }
-      url = '/' + url
-    }
-    const reg = /\/(:?)([^/*]+)(\*?)/g
-    let m: RegExpExecArray | null
-    while (m = reg.exec(url)) {
-      const param: string = m[1], name: string = m[2], last: string = m[3]
-      if (last) {
-        item.last = { name: name }
-        item = item.last
-      } else {
-        if (!item.tree)
-          throw new Error('Invalid route path')
-        if (param) {
-          item = item.param = item.param || { tree: {}, name: name }
-        } else {
-          let subitem = item.tree[name]
-          if (!subitem)
-            subitem = item.tree[name] = { tree: {} }
-          item = subitem
-        }
-      }
-    }
-    if (!item[key])
-      item[key] = []
-    item[key].push(...middlewares)
-  }
-
   /** Clear routes and middlewares */
   clear () {
-    this._routesTree = {}
     this._stack = []
+    this._router.clear()
+    this._plugin(this._router)
     return this
   }
 
@@ -822,7 +721,8 @@ export class MicroServer extends EventEmitter {
 
     this._worker.startJob()
     for (let i = 0; i < args.length; i++)
-      args[i] = await args[i]
+      if (args[i] instanceof Promise)
+        args[i] = await args[i]
 
     // use(plugin)
     if (args[0] instanceof Plugin) {
@@ -840,7 +740,7 @@ export class MicroServer extends EventEmitter {
 
     // use(middleware)
     if (isFunction(args[0])) {
-      this._addStack(args[0] as Middleware)
+      this.addStack(args[0] as Middleware)
       return this._worker.endJob()
     }
 
@@ -892,47 +792,39 @@ export class MicroServer extends EventEmitter {
     }
 
     // use('/url', ...middleware)
-    this._add(method, url, 'next', args.filter((o: any) => o))
+    this._router.add(method, url, args.filter(o => o).map((o: any) => this._bind(o) as Middleware), true)
     return this._worker.endJob()
   }
 
-  private _addStack(middleware?: Middleware): void {
-    if (!middleware)
-      return
-    const priority: number = (middleware?.priority || 0)
-    const stack = priority > 100 ? this._stackAfter : this._stack
-
-    const idx = stack.findLastIndex(f => ('priority' in f
-      && f.priority || 0) <= priority)
-    stack.splice(idx + 1, 0, middleware)
-  }
-
   private async _plugin(plugin: Plugin): Promise<void> {
-    let added: string | undefined
     if (plugin.handler) {
-      if (plugin.name) {
-        if (this._stack.find(m => m.plugin?.name === plugin))
-          throw new Error(`Plugin ${plugin.name} already added`)
-        added = plugin.name
-      }
       const middleware: Middleware = plugin.handler.bind(plugin)
       middleware.plugin = plugin
       middleware.priority = plugin.priority
-      this._addStack(middleware)
+      this.addStack(middleware)
     }
     if (plugin.routes) {
       const routes = isFunction(plugin.routes) ? await plugin.routes() : plugin.routes
       if (routes)
         await this.use(routes)
     }
-    if (added) {
-      this.emit('plugin', added)
-      this._worker.endJob('plugin:' + added)
+    if (plugin.handler && plugin.name) {
+      this.emit('plugin', plugin.name)
+      this.emit('plugin:' + plugin.name)
+      this._worker.endJob('plugin:' + plugin.name)
     }
   }
 
+  addStack(middleware: Middleware): void {
+    if (middleware.plugin?.name && this.getPlugin(middleware.plugin.name))
+      throw new Error(`Plugin ${middleware.plugin.name} already added`)
+    const priority = middleware.priority || 0
+    const idx = this._stack.findLastIndex(f => (f.priority || 0) <= priority)
+    this._stack.splice(idx + 1, 0, middleware)
+  }
+
   getPlugin (id: string): Plugin | undefined {
-    let p = this._stack.find(m => m.plugin?.name === id) || this._stackAfter.find(m => m.plugin?.name === id)
+    let p = this._stack.find(m => m.plugin?.name === id)
     return p?.plugin
   }
 
@@ -989,21 +881,15 @@ export class MicroServer extends EventEmitter {
 
   /** Add router hook, alias to `server.router.hook(url, ...args)` */
   hook (url: RouteURL, ...args: RoutesMiddleware[]): MicroServer {
-    const m = url.match(/^([A-Z]+) (.*)/)
-    if (m) {
-      const [method, url] = [m[1], m[2]]
-      this._add(method, url, 'hook', args)
-    } else {
-      for (const method of ['*', 'GET', 'POST', 'PATCH', 'PUT', 'DELETE'])
-        this._add(method, url, 'hook', args)
-    }
+    const m = url.match(/^([A-Z]+) (.*)/) || ['', 'hook', url]
+    this._router.add(m[1], m[2], args.filter(m => m).map(m => this._bind(m) as Middleware), false)
     return this
   }
 
   /** Check if middleware allready added */
   has (mid: Middleware): boolean {
     const check = (stack: Middleware[]) => stack.includes(mid) || (mid.name && !!stack.find(f => f.name === mid.name)) || false
-    return check(this._stack) || check(this._stackAfter)
+    return check(this._stack)
   }
 
   async close () {
@@ -1044,6 +930,155 @@ export interface ListenConfig {
   handler?: HttpHandler | TcpHandler
 }
 
+// #region RouterPlugin
+class RouterItem {
+  _stack?: Middleware[] // add if middlewares added if not last
+  _next?: Record<string, RouterItem> // next middlewares
+  _paramName?: string // param name if param is used
+  _paramWild?: boolean
+  _withParam?: RouterItem // next middlewares if param is used
+  _last?: Middleware[]
+}
+
+class RouterPlugin extends Plugin {
+  priority = 100
+  name = 'router'
+  //stack: Middleware[] = []
+  _tree: Record<string, RouterItem> = {}
+  constructor () {
+    super()
+  }
+
+  add(treeItem: string, path: string, middlewares: Middleware[], last: boolean): void {
+    middlewares = middlewares.filter(m => m)
+    if (!middlewares.length)
+      return
+    let node = this._tree[treeItem]
+    if (!node)
+      this._tree[treeItem] = node = { }
+
+    if (path && path !== '/') {
+      const segments = path.split('/').filter(s => s)
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i]
+        if (seg[0] === ':') {
+          const isWild = seg.endsWith('*')
+          const paramName = isWild ? seg.slice(1, -1) : seg.slice(1)
+          if (!node._withParam) {
+            node._withParam = { _paramName: paramName, _paramWild: isWild }
+          } else {
+            if (node._withParam._paramName !== paramName)
+              throw new Error(`Router param already used: ${node._withParam._paramName} != ${paramName}`)
+            if (isWild)
+              node._withParam._paramWild = true
+          }
+          node = node._withParam
+          if (isWild)
+            break
+        } else {
+          if (!node._next)
+            node._next = {}
+          if (!node._next[seg])
+            node._next[seg] = { _next: {} }
+          node = node._next[seg]
+        }
+      }
+    }
+
+    if (last) {
+      node._last ||= []
+      node._last.push(...middlewares)
+    } else {
+      node._stack ||= []
+      node._stack.push(...middlewares)
+    }
+  }
+
+  _getStack(path: string, treeItems: string[]): Middleware[] {
+    const out: Middleware[] = []
+    const segments = path.split('/').filter(s => s)
+
+    for (const key of treeItems) {
+      let node = this._tree[key]
+      if (!node)
+        continue
+
+      for (let i = 0; i < segments.length && node; i++) {
+        const seg = segments[i]
+        if (node._stack)
+          out.push(...node._stack)
+
+        // static match
+        if (node._next?.[seg]) {
+          node = node._next[seg]
+          continue
+        }
+
+        // param match
+        if (node._withParam) {
+          const paramNode = node._withParam
+          const value = paramNode._paramWild ? segments.slice(i).join('/') : seg, name = paramNode._paramName!
+          out.push((req: ServerRequest, res: ServerResponse, next: Function) => { req.params[name] = value; req.paramsList.push(value); next() })
+          node = paramNode
+          if (paramNode._paramWild)
+            break
+          else
+            continue
+        }
+        node = undefined as any
+      }
+      if (node?._stack)
+        out.push(...node._stack)
+      if (node?._last) {
+        out.push(...node._last)
+        return out
+      }
+    }
+    return out
+  }
+
+  walk(stack: Middleware[], req: ServerRequest, res: ServerResponse, next: Function) {
+    const sendData = (data: any) => {
+      if (!res.headersSent && !res.closed && data !== undefined) {
+        if ((data === null || typeof data === 'string') && !res.isJson)
+          return res.send(data)
+        if (typeof data === 'object' && 
+          (data instanceof Buffer || data instanceof Readable || data instanceof Error))
+          return res.send(data)
+        return res.jsonSuccess(data)
+      }
+    }
+    let idx = 0
+    const callNext = () => {
+      if (res.headersSent || res.closed)
+        return
+      const fn = stack[idx++]
+      if (!fn)
+        return next()
+      try {
+        const r: any = fn(req, res, callNext)
+        if (r instanceof Promise)
+          r.catch(e => e).then(sendData)
+        else
+          sendData(r)
+      } catch (e) {
+        sendData(e)
+      }
+    }
+    return callNext()
+  }
+
+  clear (): void {
+    this._tree = {}
+  }
+
+  handler (req: ServerRequest, res: ServerResponse, next: Function): void {
+    this.walk(this._getStack(req.pathname, ['hook', req.method!, '*']), req, res, next)
+  }
+}
+// #endregion RouterPlugin
+
+// #region CorsPlugin
 export interface CorsOptions {
   /** allowed origins (default: '*') */
   origin: string,
@@ -1057,39 +1092,6 @@ export interface CorsOptions {
   maxAge?: number
 }
 
-/** MicroServer configuration */
-export interface MicroServerConfig extends ListenConfig {
-  /** Auth options */
-  auth?: AuthOptions
-  /** routes to add */
-  routes?: RoutesSet
-  /** Static file options */
-  static?: StaticPluginOptions
-  /** max body size (default: 5MB) */
-  body?: BodyPluginOptions
-  /** allowed HTTP methods */
-  methods?: string
-  /** trust proxy */
-  trustproxy?: string[]
-  /** cors options */
-  cors?: string | CorsOptions | boolean
-  /** upload dir */
-  upload?: UploadPluginOptions
-  /** websocket options */
-  websocket?: WebSocketPluginOptions
-  /** extra options for plugins */
-  [key: string]: any
-}
-
-interface MicroServerEvents {
-  ready: () => void
-  close: () => void
-  listen: (port: number, address: string, server: http.Server) => void
-  error: (err: Error) => void
-  [key: `plugin:${string}`]: (plugin: Plugin) => void
-}
-
-// #region CorsPlugin
 export class CorsPlugin extends Plugin {
   priority = -100
   name = 'cors'
@@ -1097,12 +1099,16 @@ export class CorsPlugin extends Plugin {
   options?: CorsOptions
   constructor (options?: CorsOptions | string | true) {
     super()
+    if (!options) {
+      this.handler = undefined
+      return
+    }
     if (options === true)
       options = '*'
     this.options = typeof options === 'string' ? { origin: options, headers: 'Content-Type', credentials: true } : options
   }
 
-  handler(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void {
+  handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void {
     if (this.options && req.headers.origin) {
       const cors = this.options
       if (cors.origin)  
@@ -1156,7 +1162,7 @@ export class MethodsPlugin extends Plugin {
 // #endregion MethodsPlugin
 
 // #region BodyPlugin
-export interface BodyPluginOptions {
+export interface BodyOptions {
   maxBodySize?: number
 }
 export class BodyPlugin extends Plugin {
@@ -1164,7 +1170,7 @@ export class BodyPlugin extends Plugin {
   name: string = 'body'
 
   _maxBodySize: number
-  constructor (options?: BodyPluginOptions) {
+  constructor (options?: BodyOptions) {
     super()
     this._maxBodySize = options?.maxBodySize || defaultMaxBodySize
   }
@@ -1179,11 +1185,11 @@ export class BodyPlugin extends Plugin {
     req._isReady = deferPromise((err) => {
       req._isReady = undefined
       if (err) {
-        req.pause()
+        if (!req.complete)
+          req.pause()
         if (!res.headersSent)
-        res.setHeader('Connection', 'close')
-        res.error('statusCode' in err ? err.statusCode as number : 400)
-      } else
+          res.error('statusCode' in err ? err.statusCode as number : 400)
+      } else if (req.complete)
         res.removeHeader('Connection')
     })
 
@@ -1238,7 +1244,7 @@ export class BodyPlugin extends Plugin {
 // #endregion BodyPlugin
 
 // #region UploadPlugin
-export interface UploadPluginOptions {
+export interface UploadOptions {
   uploadDir?: string
   maxFileSize?: number
 }
@@ -1257,7 +1263,7 @@ export class UploadPlugin extends Plugin {
 
   _maxFileSize: number
   _uploadDir?: string
-  constructor (options?: UploadPluginOptions) {
+  constructor (options?: UploadOptions) {
     super()
     this._maxFileSize = options?.maxFileSize || defaultMaxFileSize
     this._uploadDir = options?.uploadDir
@@ -1426,7 +1432,7 @@ export class UploadPlugin extends Plugin {
 
 // #region WebSocket
 /** WebSocket options */
-export interface WebSocketPluginOptions {
+export interface WebSocketOptions {
   /** max websocket payload (default: 1MB) */
   maxPayload?: number
   /** automatically send pong frame (default: true) */
@@ -1471,10 +1477,10 @@ export class WebSocket extends EventEmitter {
   private _frame?: WebSocketFrame
   private _buffers: Buffer[] = [EMPTY_BUFFER]
   private _buffersLength: number = 0
-  private _options: WebSocketPluginOptions
+  private _options: WebSocketOptions
   public ready: boolean = false
 
-  constructor (req: ServerRequest, options?: WebSocketPluginOptions) {
+  constructor (req: ServerRequest, options?: WebSocketOptions) {
     super()
     this._socket = req.socket
     this._options = {
@@ -1848,10 +1854,11 @@ export class WebSocketPlugin extends Plugin {
       getHeader (): undefined { },
       setHeader (): void { }
     }
-    vserver.handlerRouter(req, res as unknown as ServerResponse, () => res.error(404))
+    vserver.handler(req, res as unknown as ServerResponse)
+    //vserver.handlerRouter(req, res as unknown as ServerResponse, () => res.error(404))
   }
 
-  static create (req: ServerRequest, options?: WebSocketPluginOptions): WebSocket {
+  static create (req: ServerRequest, options?: WebSocketOptions): WebSocket {
     return new WebSocket(req, options)
   }
 }
@@ -1943,7 +1950,7 @@ export class VHostPlugin extends Plugin {
 
 // #region StaticPlugin
 /** Static files options */
-export interface StaticPluginOptions {
+export interface StaticFilesOptions {
   /** files root directory */
   root?: string,
   /** url path */
@@ -1995,7 +2002,7 @@ const etagPrefix = crypto.randomBytes(4).toString('hex')
  * Usage: server.use('static', '/public')
  * Usage: server.use('static', { root: 'public', path: '/static' })
  */
-export class StaticPlugin extends Plugin {
+export class StaticFilesPlugin extends Plugin {
   priority: number = 110
   
   /** Default mime types */
@@ -2041,7 +2048,7 @@ export class StaticPlugin extends Plugin {
 
   prefix: string
 
-  constructor (options?: StaticPluginOptions | string, server?: MicroServer) {
+  constructor (options?: StaticFilesOptions | string, server?: MicroServer) {
     super()
     if (!options)
       options = {}
@@ -2052,7 +2059,7 @@ export class StaticPlugin extends Plugin {
     if (server && !server.getPlugin('static'))
       this.name = 'static'
 
-    this.mimeTypes = options.mimeTypes ? { ...StaticPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticPlugin.mimeTypes)
+    this.mimeTypes = options.mimeTypes ? { ...StaticFilesPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticFilesPlugin.mimeTypes)
     this.root = path.resolve((options.root || options?.path || 'public').replace(/^\//, '')) + path.sep
     this.ignore = (options.ignore || []).map((p: string) => path.normalize(path.join(this.root, p)) + path.sep)
     this.index = options.index || 'index.html'
@@ -2069,7 +2076,7 @@ export class StaticPlugin extends Plugin {
     res.file = (path: string | ServeFileOptions) => {
       this.serveFile(req, res, typeof path === 'object' ? path : {
         path,
-        mimeType: StaticPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
+        mimeType: StaticFilesPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
       })
     }
     if (req.method !== 'GET')
@@ -2122,7 +2129,7 @@ export class StaticPlugin extends Plugin {
   }
 
   serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
-    const filePath: string = path.join(options.root || this.root, options.path)
+    const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.root, options.path)
     const statRes = (err: NodeJS.ErrnoException | null, stats: fs.Stats): void => {
       if (err)
         return res.error(err)
@@ -2178,7 +2185,7 @@ export class StaticPlugin extends Plugin {
 
 // #region ProxyPlugin
 /** Proxy plugin options */
-export interface ProxyPluginOptions {
+export interface ProxyOptions {
   /** Base path */
   path?: string,
   /** Remote url */
@@ -2223,7 +2230,7 @@ export class ProxyPlugin extends Plugin {
   /** Match regex filter */
   regex?: RegExp
 
-  constructor (options?: ProxyPluginOptions | string, server?: MicroServer) {
+  constructor (options?: ProxyOptions | string, server?: MicroServer) {
     super()
     if (typeof options !== 'object')
       options = { remote: options }
@@ -2532,6 +2539,8 @@ export class Auth {
 
   /** Get hashed string from user and password */
   static password (usr: string, psw: string, salt?: string): string {
+    if (psw.length < 128)
+      psw = crypto.createHash('sha512').update(psw).digest('hex')
     if (usr)
       psw = crypto.createHash('sha512').update(usr + '|' + psw).digest('hex')
     if (salt) {
@@ -2788,7 +2797,7 @@ export class StandardPlugins extends Plugin {
     use(CorsPlugin, 'cors')
     use(TrustProxyPlugin, 'trustproxy')
     use(BodyPlugin)
-    use(StaticPlugin, 'static')
+    use(StaticFilesPlugin, 'static')
     use(AuthPlugin, 'auth')
   }
 }
@@ -2860,7 +2869,6 @@ export class Controller<T extends Model<any> = any> {
   constructor (req: ServerRequest<T>, res: ServerResponse<T>) {
     this.req = req
     this.res = res
-    res.isJson = true
   }
 
   /** Generate routes for this controller */
@@ -2960,7 +2968,7 @@ export class Controller<T extends Model<any> = any> {
           args.push('/:id' + i)
         url += args.join('')
       }
-      const list: Array<string|Function> = [method + ' ' + url.replace(/\/\//g, '/')]
+      const list: Array<string|Function> = [method + ' ' + url.replace(/\/\//g, '/'), 'response:json']
       if (acl)
         list.push('acl:' + acl)
       if (user)
@@ -2985,16 +2993,7 @@ export class Controller<T extends Model<any> = any> {
 }
 // #endregion Controller
 
-/** Internal router item */
-interface RouterItem {
-  name?: string
-  hook?: Middleware[]
-  next?: Middleware[]
-  param?: RouterItem
-  last?: RouterItem
-  tree?: Record<string, RouterItem>
-}
-
+// #region Worker
 class WorkerJob {
   _promises: any = []
   _busy: number = 0
@@ -3050,6 +3049,7 @@ class Worker {
     return job.wait()
   }
 }
+// #endregion Worker
 
 // #region FileStore
 export interface FileStoreOptions {
