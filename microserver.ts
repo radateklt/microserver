@@ -117,7 +117,7 @@ export type ServerRequestBody<T = any> = T extends Model<infer U extends ModelSc
 /** Extended http.IncomingMessage */
 export class ServerRequest<T = any> extends http.IncomingMessage {
   /** Request client IP */
-  public ip?: string
+  public ip!: string
   /** Request from local network */
   public localip?: boolean
   /** Request is secure (https) */
@@ -162,8 +162,12 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
 
   static extend(req: http.IncomingMessage, server: MicroServer): ServerRequest {
     const reqNew = Object.setPrototypeOf(req, ServerRequest.prototype) as ServerRequest
+    let ip = req.socket.remoteAddress || '::1';
+    if (ip.startsWith('::ffff:'))
+      ip = ip.slice(7);
     Object.assign(reqNew, {
       server,
+      ip,
       auth: server.auth,
       protocol: 'encrypted' in req.socket && req.socket.encrypted ? 'https' : 'http',
       query: {},
@@ -180,7 +184,7 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   }
 
   get isReady() {
-    return this._isReady !== undefined
+    return this._isReady === undefined
   }
 
   async waitReady(): Promise<void> {
@@ -1017,7 +1021,7 @@ class RouterPlugin extends Plugin {
         // param match
         if (node._withParam) {
           const paramNode = node._withParam
-          const value = paramNode._paramWild ? segments.slice(i).join('/') : seg, name = paramNode._paramName!
+          const value = decodeURIComponent(paramNode._paramWild ? segments.slice(i).join('/') : seg), name = paramNode._paramName!
           out.push((req: ServerRequest, res: ServerResponse, next: Function) => { req.params[name] = value; req.paramsList.push(value); next() })
           node = paramNode
           if (paramNode._paramWild)
@@ -1305,98 +1309,74 @@ export class UploadPlugin extends Plugin {
       return files
     }
 
-    let boundary = ''
-    if (!contentType.split(';').find(l => {
-      const idx = l.indexOf('boundary=')
-      if (idx < 0) return
-      boundary = '\r\n--' + l.slice(idx + 9).trim()
-      return true
-    }))
-      return res.error(400)
+    const boundaryIdx = contentType.indexOf('boundary=')
+    if (boundaryIdx < 0)
+      return res.error(405)
+    const boundary = Buffer.from('--' + contentType.slice(boundaryIdx + 9).trim())
+    const lookahead = boundary.length + 6;
 
-    let lastChunk: Buffer | undefined
     let lastFile: UploadFile | undefined
     let fileStream: fs.WriteStream | undefined
-    const body = req._body = {} as any
-    let bodyChunk: Buffer[] | undefined
+    let buffer = Buffer.alloc(0)
 
     const chunkParse = (chunk: Buffer) => {
-      if (req.isReady)
-        return
-      chunk = lastChunk = lastChunk ? Buffer.concat([lastChunk, chunk]) : chunk
-      const p: number = chunk.indexOf(boundary) || -1
-      if (p >= 0 && chunk.length - p >= 2) {
-        if (fileStream) {
-          if (p > 0) {
-            lastFile!.size += p
-            fileStream.write(chunk.subarray(0, p))
-          }
-          fileStream.close()
-          fileStream = undefined
-          lastFile = undefined
-        }
-        let pe = p + boundary.length
-        if (chunk[pe] === 13 && chunk[pe + 1] === 10) {
-          chunk = lastChunk = chunk.subarray(p)
-          // next header
-          pe = chunk.indexOf('\r\n\r\n')
-          if (pe > 0) { // whole header
-            const header = chunk.toString('utf8', boundary.length + 2, pe)
-            chunk = chunk.subarray(pe + 4)
-            const fileInfo = header.match(/content-disposition: ([^\r\n]+)/i)
-            const contentType = header.match(/content-type: ([^\r\n;]+)/i)
-            let fieldName: string = '', fileName: string = ''
-            if (fileInfo)
-              fileInfo[1].replace(/(\w+)="?([^";]+)"?/, (_: string, n: string, v: string) => {
-                if (n === 'name')
-                  fieldName = v
-                if (n === 'filename')
-                  fileName = v
-                return _
-              })
-            if (fileName) {
-              let filePath: string
-              do {
-                filePath = path.resolve(path.join(uploadDir, crypto.randomBytes(16).toString('hex') + '.tmp'))
-              } while (fs.existsSync(filePath))
-              lastFile = {
-                name: fieldName,
-                fileName: fileName,
-                contentType: contentType && contentType[1] || undefined,
-                filePath,
-                size: 0
-              }
-              fileStream = fs.createWriteStream(filePath)
-              files.push(lastFile)
-            } else if (fieldName) {
-              bodyChunk = []
-              lastFile = {
-                name: fieldName,
-                size: 0
-              }
-              fileStream = {
-                write: (chunk: Buffer) => {
-                  bodyChunk!.push(chunk)
-                  return true
-                },
-                close () {
-                  body[fieldName] = Buffer.concat(bodyChunk!).toString()
-                  bodyChunk = undefined
-                }
-              } as fs.WriteStream
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length > 0) {
+        if (!fileStream) {
+          const boundaryIndex = buffer.indexOf(boundary)
+          if (boundaryIndex < 0)
+            break
+          const headerEndIndex = buffer.indexOf('\r\n\r\n', boundaryIndex)
+          if (headerEndIndex < 0)
+            break
+          const header = buffer.subarray(boundaryIndex, headerEndIndex).toString()
+          const contentType = header.match(/content-type: ([^\r\n;]+)/i)
+          const filenameMatch = header.match(/filename="(.+?)"/)
+
+          if (filenameMatch) {
+            let filePath
+            do {
+              filePath = path.resolve(path.join(uploadDir, crypto.randomBytes(16).toString('hex') + '.tmp'))
+            } while (fs.existsSync(filePath))
+            buffer = buffer.slice(headerEndIndex + 4)
+            lastFile = {
+              name: filenameMatch[1],
+              fileName: filenameMatch[1],
+              contentType: contentType && contentType[1] || undefined,
+              filePath,
+              size: 0
             }
+            fileStream = fs.createWriteStream(filePath)
+            files.push(lastFile)
+          } else {
+            const nextBoundary = buffer.indexOf(boundary, boundaryIndex + boundary.length)
+            if (nextBoundary === -1)
+              break
+            buffer = buffer.subarray(nextBoundary)
           }
         } else {
-          lastChunk = undefined
-          req._isReady?.resolve()
-        }
-      } else {
-        if (chunk.length > 8096) {
-          if (fileStream) {
-            lastFile!.size += p
-            fileStream.write(chunk.subarray(0, boundary.length - 1))
+          const nextBoundaryIndex = buffer.indexOf(boundary)
+          const nextBoundaryIndexEnd = nextBoundaryIndex + boundary.length
+          if (nextBoundaryIndex > 1 && buffer[nextBoundaryIndex - 2] === 13 && buffer[nextBoundaryIndex - 1] === 10
+            && ((buffer[nextBoundaryIndexEnd] === 13 && buffer[nextBoundaryIndexEnd + 1] === 10)
+            || (buffer[nextBoundaryIndexEnd] === 45 && buffer[nextBoundaryIndexEnd + 1] === 45))
+          ) {
+            fileStream.write(buffer.subarray(0, nextBoundaryIndex - 2))
+            fileStream.end()
+            lastFile!.size += nextBoundaryIndex - 2
+            fileStream = undefined
+            if (buffer[nextBoundaryIndexEnd] === 45)
+              req._isReady?.resolve()
+            buffer = buffer.subarray(nextBoundaryIndex)
+          } else {
+            const safeWriteLength = buffer.length - lookahead
+            if (safeWriteLength > 0) {
+              lastFile!.size += safeWriteLength
+              fileStream.write(buffer.subarray(0, safeWriteLength))
+              buffer = buffer.subarray(safeWriteLength)
+            }
+            break
           }
-          chunk = lastChunk = chunk.subarray(boundary.length - 1)
         }
       }
     }
@@ -1881,9 +1861,6 @@ export class TrustProxyPlugin extends Plugin {
   }
 
   handler(req: ServerRequest, res: ServerResponse, next: Function): void {
-    req.ip = req.socket.remoteAddress || '::1'
-    if (req.ip.startsWith('::ffff:'))
-      req.ip = req.ip.slice(7)
     req.localip = this.isLocal(req.ip)
     const xip = req.headers['x-real-ip'] || req.headers['x-forwarded-for']
     if (xip) {
