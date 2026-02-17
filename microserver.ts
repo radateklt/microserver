@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.0
+ * @version 3.0.2
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -77,13 +77,10 @@ export class WebSocketError extends Error {
 type DeferPromise<T = void> = Promise<T> & { resolve: (res?: T | Error) => void }
 function deferPromise<T = void>(cb?: (res?: T | Error) => void): DeferPromise<T> {
   let _resolve!: (res?: T | Error) => void
-  const p: Promise<T> & { resolve: (res?: T | Error) => void } = new Promise((resolve, reject) => {
+  const p: Promise<T> & { resolve: (res?: T | Error) => void } = new Promise((resolve) => {
     _resolve = (res?: T | Error) => {
       cb?.(res)
-      if (res instanceof Error)
-        reject(res)
-      else
-        resolve(res as T)
+      resolve(res as T)
     }
   }) as DeferPromise<T>
   p.resolve = _resolve
@@ -190,7 +187,9 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   async waitReady(): Promise<void> {
     if (this._isReady === undefined)
       return
-    await this._isReady
+    const res: any = await this._isReady
+    if (res && res instanceof Error)
+      throw res
   }
 
   /** Update request url */
@@ -310,29 +309,31 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   send (data: string | Buffer | Error | Readable | object = ''): void {
     if (this.headersSent)
       return
-    if (!this.req.complete) {
-      this.req.pause()
-      this.setHeader('Connection', 'close')
-    }
-    if (data instanceof Readable)
-      return (data.pipe(this, {end: true}), void 0)
-    if (!this.getHeader('Content-Type') && !(data instanceof Buffer)) {
+    if (typeof data === 'object' || this.isJson) {
       if (data instanceof Error)
         return this.error(data)
-      if (this.isJson || typeof data === 'object') {
-        data = JSON.stringify(typeof data === 'string' ? { message: data } : data)
-        this.setHeader('Content-Type', 'application/json')
-      } else {
-        data = data.toString()
-        if (data[0] === '{' || data[1] === '[')
-          this.setHeader('Content-Type', 'application/json')
-        else if (data[0] === '<' && (data.startsWith('<!DOCTYPE') || data.startsWith('<html')))
-          this.setHeader('Content-Type', 'text/html')
+      if (data instanceof Readable)
+        return (data.pipe(this, {end: true}), void 0)
+      if (data instanceof Buffer) {
+        this.setHeader('Content-Length', data.byteLength)
+        if (this.headersOnly)
+          this.end()
         else
-          this.setHeader('Content-Type', 'text/plain')
+          this.end(data)
+        return
       }
+      data = JSON.stringify(typeof data === 'string' ? { message: data } : data)
+      this.setHeader('Content-Type', 'application/json')
     }
     data = data.toString()
+    if (!this.getHeader('Content-Type')) {
+      if (data[0] === '{' || data[1] === '[')
+        this.setHeader('Content-Type', 'application/json')
+      else if (data[0] === '<' && (data.startsWith('<!DOCTYPE') || data.startsWith('<html')))
+        this.setHeader('Content-Type', 'text/html')
+      else
+        this.setHeader('Content-Type', 'text/plain')
+    }
     this.setHeader('Content-Length', Buffer.byteLength(data, 'utf8'))
     if (this.headersOnly)
       this.end()
@@ -439,6 +440,7 @@ export class MicroServer extends EventEmitter {
   public config: MicroServerConfig
   public auth?: Auth
 
+  private _plugins: Record<string, Plugin> = {}
   private _stack: Middleware[] = []
   private _router: RouterPlugin = new RouterPlugin()
   private _worker: Worker = new Worker()
@@ -707,6 +709,7 @@ export class MicroServer extends EventEmitter {
   /** Clear routes and middlewares */
   clear () {
     this._stack = []
+    this._plugins = {}
     this._router.clear()
     this._plugin(this._router)
     return this
@@ -813,6 +816,7 @@ export class MicroServer extends EventEmitter {
         await this.use(routes)
     }
     if (plugin.handler && plugin.name) {
+      this._plugins[plugin.name] = plugin
       this.emit('plugin', plugin.name)
       this.emit('plugin:' + plugin.name)
       this._worker.endJob('plugin:' + plugin.name)
@@ -828,8 +832,7 @@ export class MicroServer extends EventEmitter {
   }
 
   getPlugin (id: string): Plugin | undefined {
-    let p = this._stack.find(m => m.plugin?.name === id)
-    return p?.plugin
+    return this._plugins[id]
   }
 
   async waitPlugin (id: string): Promise<Plugin> {
@@ -1365,8 +1368,10 @@ export class UploadPlugin extends Plugin {
             fileStream.end()
             lastFile!.size += nextBoundaryIndex - 2
             fileStream = undefined
-            if (buffer[nextBoundaryIndexEnd] === 45)
+            if (buffer[nextBoundaryIndexEnd] === 45) {
+              res.removeHeader('Connection')
               req._isReady?.resolve()
+            }
             buffer = buffer.subarray(nextBoundaryIndex)
           } else {
             const safeWriteLength = buffer.length - lookahead
@@ -1946,6 +1951,8 @@ export interface StaticFilesOptions {
   etag?: boolean
   /** Max file age in seconds */
   maxAge?: number
+  /** static errors file for status code, '*' - default */
+  errors?: Record<string, string>
 }
 
 export interface ServeFileOptions {
@@ -2025,6 +2032,8 @@ export class StaticFilesPlugin extends Plugin {
 
   prefix: string
 
+  errors?: Record<string, string>
+
   constructor (options?: StaticFilesOptions | string, server?: MicroServer) {
     super()
     if (!options)
@@ -2037,25 +2046,42 @@ export class StaticFilesPlugin extends Plugin {
       this.name = 'static'
 
     this.mimeTypes = options.mimeTypes ? { ...StaticFilesPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticFilesPlugin.mimeTypes)
-    this.root = path.resolve((options.root || options?.path || 'public').replace(/^\//, '')) + path.sep
+    this.root = (options.root && path.isAbsolute(options.root) ? options.root : path.resolve(options.root || options?.path || 'public')).replace(/[\/\\]$/, '') + path.sep
     this.ignore = (options.ignore || []).map((p: string) => path.normalize(path.join(this.root, p)) + path.sep)
     this.index = options.index || 'index.html'
     this.handlers = options.handlers
     this.lastModified = options.lastModified !== false
     this.etag = options.etag !== false
     this.maxAge = options.maxAge
+    this.errors = options.errors
 
     this.prefix = ('/' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '')).replace(/\/$/, '')
-  }
 
-  /** Default static files handler */
-  handler (req: ServerRequest, res: ServerResponse, next: Function) {
-    res.file = (path: string | ServeFileOptions) => {
-      this.serveFile(req, res, typeof path === 'object' ? path : {
+    const defSend = ServerResponse.prototype.send
+
+    ServerResponse.prototype.send = function (data: any) {
+      const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
+      if (this.statusCode < 400 || this.isJson || typeof data !== 'string' || !plugin?.errors || this.getHeader('Content-Type'))
+        return defSend.call(this, data)
+      const errFile: string = plugin.errors[this.statusCode] || plugin.errors['*']
+      if (errFile)
+        plugin.serveFile(this.req, this, {path: errFile, mimeType: 'text/html'})
+      return defSend.call(this, data)
+    }
+
+    ServerResponse.prototype.file = function (path: string | ServeFileOptions) {
+      const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
+      if (!plugin)
+        throw new Error('Server error')
+      plugin.serveFile(this.req, this, typeof path === 'object' ? path : {
         path,
         mimeType: StaticFilesPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
       })
     }
+  }
+
+  /** Default static files handler */
+  handler (req: ServerRequest, res: ServerResponse, next: Function) {
     if (req.method !== 'GET')
       return next()
     if (!('path' in req.params)) { // global handler
@@ -2108,10 +2134,12 @@ export class StaticFilesPlugin extends Plugin {
   serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
     const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.root, options.path)
     const statRes = (err: NodeJS.ErrnoException | null, stats: fs.Stats): void => {
-      if (err)
-        return res.error(err)
-      if (!stats.isFile())
-        return res.error(404)
+      if (err || !stats.isFile()) {
+        if (res.statusCode < 400)
+          return res.error(404)
+        res.end(res.statusCode + ' ' + http.STATUS_CODES[res.statusCode])
+        return
+      }
 
       if (!res.getHeader('Content-Type')) {
         if (options.mimeType)
