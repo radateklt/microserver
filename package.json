@@ -17,10 +17,13 @@
     "url": "https://github.com/radateklt/microserver.git"
   },
   "scripts": {
-    "prepublishOnly": "pnpm build && echo 'call: pnpm run publish' && exit 1",
-    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g;s/export \\{\\};//g' dist/microserver.d.ts; cp package.json dist/package.json && sed -Ei ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"microserver.js\",\\n  \"module\": \"microserver.js\",\\n  \"types\": \"microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' dist/package.json",
-    "test": "node test.ts",
-    "publish": "pnpm publish dist --access public"
+    "prepublishOnly": "pnpm build",
+    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g;s/export \\{\\};//g' dist/microserver.d.ts; sed -E ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"microserver.js\",\\n  \"module\": \"microserver.js\",\\n  \"types\": \"microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json > dist/package.json && cp README.md dist/",
+    "test": "node test.ts"
+  },
+  "publishConfig": {
+    "directory": "dist",
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^25.2.3"

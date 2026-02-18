@@ -58,6 +58,21 @@ server.use('GET /api/protected', 'acl:auth',
 server.use(StaticPlugin, {root:'public'})
 ```
 
+Using WebSockets
+
+```ts
+import { MicroServer, WebSocketsPlugin } from '@radatek/microserver'
+
+const server = new MicroServer({
+  listen: 8080
+})
+server.use(WebSocketsPlugin)
+server.use('WEBSOCKET /ws', (req: ServerRequset, res: ServerResponse) => {
+  req.websocket.on('message', (data) => console.log(data))
+  req.websocket.on('close', () => console.log('closed'))
+})
+```
+
 Using data schema:
 
 ```js

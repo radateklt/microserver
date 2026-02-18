@@ -156,7 +156,7 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
     super(new net.Socket())
     ServerRequest.extend(this, res, server)
   }
-
+  /** Extend http.IncomingMessage */
   static extend(req: http.IncomingMessage, res: http.ServerResponse, server: MicroServer): ServerRequest {
     const reqNew = Object.setPrototypeOf(req, ServerRequest.prototype) as ServerRequest
     let ip = req.socket.remoteAddress || '::1';
@@ -189,10 +189,12 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
     return reqNew
   }
 
+  /** Check if request is ready */
   get isReady() {
     return this._isReady === undefined
   }
 
+  /** Wait for request to be ready, usualy used to wait for file upload */
   async waitReady(): Promise<void> {
     if (this._isReady === undefined)
       return
@@ -201,10 +203,12 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
       throw res
   }
 
+  /** Signal request as ready */
   setReady(err?: Error): void {
     this._isReady?.resolve(err)
   }
 
+  /** Set request body */
   setBody(body: ServerRequestBody<T>): void {
     this._body = body
   }
@@ -253,8 +257,8 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
 /** Extends http.ServerResponse */
 export class ServerResponse<T = any> extends http.ServerResponse {
   declare readonly req: ServerRequest<T>
+  /** Should response be json */
   public isJson!: boolean
-  public headersOnly!: boolean
 
   private constructor (server: MicroServer) {
     super(new http.IncomingMessage(new net.Socket()))
@@ -262,12 +266,12 @@ export class ServerResponse<T = any> extends http.ServerResponse {
     ServerResponse.extend(this)
   }
 
+  /** Extends http.ServerResponse */
   static extend (res: http.ServerResponse) {
     Object.setPrototypeOf(res, ServerResponse.prototype)
     Object.assign(res, {
       statusCode: 200,
-      isJson: false,
-      headersOnly: false
+      isJson: false
     })
   }
 
@@ -334,7 +338,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
         return (data.pipe(this, {end: true}), void 0)
       if (data instanceof Buffer) {
         this.setHeader('Content-Length', data.byteLength)
-        if (this.headersOnly)
+        if (this.statusCode === 304 || this.req.method === 'HEAD')
           this.end()
         else
           this.end(data)
@@ -353,7 +357,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
         this.setHeader('Content-Type', 'text/plain')
     }
     this.setHeader('Content-Length', Buffer.byteLength(data, 'utf8'))
-    if (this.headersOnly)
+    if (this.statusCode === 304 || this.req.method === 'HEAD')
       this.end()
     else
       this.end(data, 'utf8')
@@ -455,7 +459,9 @@ interface MicroServerEvents {
 
 /** Lighweight HTTP server */
 export class MicroServer extends EventEmitter {
+  /** MicroServer configuration */
   public config: MicroServerConfig
+  /** Authorization object */
   public auth?: Auth
 
   private _plugins: Record<string, Plugin> = {}
@@ -463,9 +469,9 @@ export class MicroServer extends EventEmitter {
   private _router: RouterPlugin = new RouterPlugin()
   private _worker: Worker = new Worker()
   
-  /** all sockets */
+  /** All sockets */
   public sockets: Set<net.Socket> | undefined
-  /** server instances */
+  /** Server instances */
   public servers: Set<net.Server> | undefined
 
   /** @param {MicroServerConfig} [config] MicroServer configuration  */
@@ -600,8 +606,8 @@ export class MicroServer extends EventEmitter {
     return this._worker.wait('listen')
   }
 
-  /** bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
-  _bind (fn: string | Function | object): Function {
+  /* bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
+  private _bind (fn: RoutesMiddleware): Function {
     if (typeof fn === 'string') {
       let name = fn
       let idx = name.indexOf(':')
@@ -702,18 +708,8 @@ export class MicroServer extends EventEmitter {
     ServerRequest.extend(req, res, this)
     ServerResponse.extend(res)
     this._router.walk(this._stack, req, res, () => res.error(404))
-    //this.handlerRouter(req, res, () => this.handlerLast(req, res))
   }
   
-  /** Last request handler */
-  handlerLast (req: ServerRequest, res: ServerResponse, next?: Function) {
-    if (res.headersSent || res.closed)
-      return
-    if (!next)
-      next = () => res.error(404)
-    return next()
-  }
-
   /** Clear routes and middlewares */
   clear () {
     this._stack = []
@@ -724,7 +720,7 @@ export class MicroServer extends EventEmitter {
   }
 
   /**
-   * Add middleware route.
+   * Add middleware, plugin or routes to server.
    * Middlewares may return promises for res.jsonSuccess(...), throw errors for res.error(...), return string or {} for res.send(...)
    * RouteURL: 'METHOD /suburl', 'METHOD', '* /suburl'
    */
@@ -831,6 +827,7 @@ export class MicroServer extends EventEmitter {
     }
   }
 
+  /** Add middleware to stack, with optional priority */
   addStack(middleware: Middleware): void {
     if (middleware.plugin?.name && this.getPlugin(middleware.plugin.name))
       throw new Error(`Plugin ${middleware.plugin.name} already added`)
@@ -839,10 +836,12 @@ export class MicroServer extends EventEmitter {
     this._stack.splice(idx + 1, 0, middleware)
   }
 
+  /** Get plugin */
   getPlugin (id: string): Plugin | undefined {
     return this._plugins[id]
   }
 
+  /** Wait for plugin */
   async waitPlugin (id: string): Promise<Plugin> {
     const p = this.getPlugin(id)
     if (p)
@@ -852,49 +851,49 @@ export class MicroServer extends EventEmitter {
     return this.getPlugin(id)!
   }
 
-  /** Add route, alias to `server.router.use(url, ...args)` */
+  /** Add route, alias to `server.use(url, ...args)` */
   all (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('* ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.use('GET ' + url, ...args)` */
+  /** Add route, alias to `server.use('GET ' + url, ...args)` */
   get (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('GET ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.use('POST ' + url, ...args)` */
+  /** Add route, alias to `server.use('POST ' + url, ...args)` */
   post (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('POST ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.use('PUT ' + url, ...args)` */
+  /** Add route, alias to `server.use('PUT ' + url, ...args)` */
   put (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('PUT ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.use('PATCH ' + url, ...args)` */
+  /** Add route, alias to `server.use('PATCH ' + url, ...args)` */
   patch (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('PATCH ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add route, alias to `server.router.use('DELETE ' + url, ...args)` */
+  /** Add route, alias to `server.use('DELETE ' + url, ...args)` */
   delete (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('DELETE ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add websocket handler, alias to `server.router.use('WEBSOCKET ' + url, ...args)` */
+  /** Add websocket handler, alias to `server.use('WEBSOCKET ' + url, ...args)` */
   websocket (url: `/${string}`, ...args: RoutesMiddleware[]): MicroServer {
     this.use('WEBSOCKET ' + url as RouteURL, ...args)
     return this
   }
 
-  /** Add router hook, alias to `server.router.hook(url, ...args)` */
+  /** Add router hook, alias to `server.hook(url, ...args)` */
   hook (url: RouteURL, ...args: RoutesMiddleware[]): MicroServer {
     const m = url.match(/^([A-Z]+) (.*)/) || ['', 'hook', url]
     this._router.add(m[1], m[2], args.filter(m => m).map(m => this._bind(m) as Middleware), false)
@@ -958,8 +957,8 @@ class RouterItem {
 class RouterPlugin extends Plugin {
   priority = 100
   name = 'router'
-  //stack: Middleware[] = []
-  _tree: Record<string, RouterItem> = {}
+
+  private _tree: Record<string, RouterItem> = {}
   constructor () {
     super()
   }
@@ -1009,7 +1008,7 @@ class RouterPlugin extends Plugin {
     }
   }
 
-  _getStack(path: string, treeItems: string[]): Middleware[] {
+  private _getStack(path: string, treeItems: string[]): Middleware[] {
     const out: Middleware[] = []
     const segments = path.split('/').filter(s => s)
 
@@ -1088,7 +1087,8 @@ class RouterPlugin extends Plugin {
   }
 
   handler (req: ServerRequest, res: ServerResponse, next: Function): void {
-    this.walk(this._getStack(req.pathname, ['hook', req.method!, '*']), req, res, next)
+    const method = req.method === 'HEAD' ? 'GET' : req.method || 'GET'
+    this.walk(this._getStack(req.pathname, ['hook', method, '*']), req, res, next)
   }
 }
 // #endregion RouterPlugin
@@ -1147,8 +1147,8 @@ export class MethodsPlugin extends Plugin {
   priority = -90
   name = 'methods'
 
-  _methods: string
-  _methodsIdx: Record<string, boolean>
+  private _methods: string
+  private _methodsIdx: Record<string, boolean>
   constructor(methods?: string) {
     super()
 
@@ -1167,10 +1167,6 @@ export class MethodsPlugin extends Plugin {
       res.setHeader('Allow', this._methods)
       return res.status(405).end()
     }
-    if (req.method === 'HEAD') {
-      req.method = 'GET'
-      res.headersOnly = true
-    }
     return next()    
   }
 }
@@ -1184,14 +1180,14 @@ export class BodyPlugin extends Plugin {
   priority: number = -80
   name: string = 'body'
 
-  _maxBodySize: number
+  private _maxBodySize: number
   constructor (options?: BodyOptions) {
     super()
     this._maxBodySize = options?.maxBodySize || defaultMaxBodySize
   }
 
   handler(req: ServerRequest, res: ServerResponse, next: () => void) {
-    if (req.complete || req.method === 'GET') {
+    if (req.complete || req.method === 'GET' || req.method === 'HEAD') {
       if (!req.body)
         req.setBody({})
       return next()
@@ -1256,8 +1252,8 @@ export class UploadPlugin extends Plugin {
   priority: number = -70
   name: string = 'upload'
 
-  _maxFileSize: number
-  _uploadDir?: string
+  private _maxFileSize: number
+  private _uploadDir?: string
   constructor (options?: UploadOptions) {
     super()
     this._maxFileSize = options?.maxFileSize || defaultMaxFileSize
@@ -1265,7 +1261,7 @@ export class UploadPlugin extends Plugin {
   }
 
   handler (req: ServerRequest, res: ServerResponse, next: () => void) {
-    if (!req.readable || req.method === 'GET')
+    if (!req.readable || req.method === 'GET' || req.method === 'HEAD')
       return next()
     const contentType = req.headers['content-type'] || ''
     if (!contentType.startsWith('multipart/form-data'))
@@ -1725,7 +1721,7 @@ export class WebSocket extends EventEmitter {
     this._sendFrame(0x8A, buffer || EMPTY_BUFFER)
   }
 
-  protected _sendFrame (opcode: number, data: Buffer, cb?: () => void) {
+  private _sendFrame (opcode: number, data: Buffer, cb?: () => void) {
     if (!this.ready)
       return
     const dataLength: number = data.length
@@ -1754,7 +1750,7 @@ export class WebSocket extends EventEmitter {
 export class WebSocketPlugin extends Plugin {
   name: string = 'websocket'
   
-  _handler: (req: ServerRequest, socket: net.Socket, head: any) => void
+  private _handler: (req: ServerRequest, socket: net.Socket, head: any) => void
   constructor (options?: any, server?: MicroServer) {
     super()
     if (!server)
@@ -1764,7 +1760,7 @@ export class WebSocketPlugin extends Plugin {
     server.on('listen', (port: number, address: string, srv: http.Server) => this.addUpgradeHandler(srv))
   }
 
-  addUpgradeHandler (srv: http.Server) {
+  private addUpgradeHandler (srv: http.Server) {
     if (!srv.listeners('upgrade').includes(this._handler as any))
       srv.on('upgrade', this._handler)
   }
@@ -2061,7 +2057,7 @@ export class StaticFilesPlugin extends Plugin {
 
   /** Default static files handler */
   handler (req: ServerRequest, res: ServerResponse, next: Function) {
-    if (req.method !== 'GET')
+    if (req.method !== 'GET' && req.method !== 'HEAD')
       return next()
     if (!('path' in req.params)) { // global handler
       if (req.path.startsWith(this.prefix) && (req.path === this.prefix || req.path[this.prefix.length] === '/')) {
@@ -2110,6 +2106,7 @@ export class StaticFilesPlugin extends Plugin {
     })
   }
 
+  /** Send static file */
   serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
     const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.root, options.path)
     const statRes = (err: NodeJS.ErrnoException | null, stats: fs.Stats): void => {
@@ -2133,14 +2130,12 @@ export class StaticFilesPlugin extends Plugin {
       res.setHeader('Content-Length', stats.size)
       if (options.etag !== false) {
         const etag = '"' + etagPrefix + stats.mtime.getTime().toString(32) + '"'
-        if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === stats.mtime.toUTCString()) {
+        if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === stats.mtime.toUTCString())
           res.statusCode = 304
-          res.headersOnly = true
-        }
       }
       if (options.maxAge)
         res.setHeader('Cache-Control', 'max-age=' + options.maxAge)
-      if (res.headersOnly) {
+      if (res.statusCode === 304 || req.method === 'HEAD') {
         res.end()
         return
       }
@@ -3101,12 +3096,14 @@ export class FileStore {
     return p
   }
 
+  /** close store */
   async close () {
     await this.sync()
     this._iter = 0
     this._cache = {}
   }
 
+  /** sync data to disk */
   async sync () {
     for (const name in this._cache) {
       for (const key in this._cache)
@@ -4043,6 +4040,7 @@ export class MicroCollection<TSchema extends ModelSchema = any> {
     return (await this.updateMany(query, {}, {delete: true})).modifiedCount
   }
 
+  /** Update one matching document */
   async updateOne(query: Query, update: Record<string, any>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
     const res = await this.updateMany(
       query,
@@ -4052,6 +4050,7 @@ export class MicroCollection<TSchema extends ModelSchema = any> {
     return res
   }
 
+  /** Update many matching documents */
   async updateMany(query: Query, update: Record<string, any>, options?: FindOptions): Promise<{upsertedId: any, modifiedCount: number}> {
     let res = {upsertedId: undefined, modifiedCount: 0}
     if (!query)
