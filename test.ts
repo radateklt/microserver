@@ -316,7 +316,7 @@ test('Middleware', async () => {
       handler(req: ServerRequest, res: ServerResponse, next: Function) {next()}
     }
     await server.use(TestPlugin1)
-    assert(!server.getPlugin('test1'), 'Invalid plugin 1')
+    assert(server.getPlugin('test1'), 'Invalid plugin 1')
     await server.use(TestPlugin2)
     assert(server.getPlugin('test2'), 'Invalid plugin 2')
     let failed = false

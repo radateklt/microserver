@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.3
+ * @version 3.0.5
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -819,7 +819,9 @@ export class MicroServer extends EventEmitter {
       if (routes)
         await this.use(routes)
     }
-    if (plugin.handler && plugin.name) {
+    if (plugin.name) {
+      if (this._plugins[plugin.name])
+        throw new Error(`Plugin ${plugin.name} already added`)
       this._plugins[plugin.name] = plugin
       this.emit('plugin', plugin.name)
       this.emit('plugin:' + plugin.name)
@@ -2016,10 +2018,6 @@ export class StaticFilesPlugin extends Plugin {
     if (typeof options === 'string')
       options = { root: options }
 
-    // allow multiple instances
-    if (server && !server.getPlugin('static'))
-      this.name = 'static'
-
     this.mimeTypes = options.mimeTypes ? { ...StaticFilesPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticFilesPlugin.mimeTypes)
     this.root = (options.root && path.isAbsolute(options.root) ? options.root : path.resolve(options.root || options?.path || 'public')).replace(/[\/\\]$/, '') + path.sep
     this.ignore = (options.ignore || []).map((p: string) => path.normalize(path.join(this.root, p)) + path.sep)
@@ -2034,24 +2032,30 @@ export class StaticFilesPlugin extends Plugin {
 
     const defSend = ServerResponse.prototype.send
 
-    ServerResponse.prototype.send = function (data: any) {
-      const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
-      if (this.statusCode < 400 || this.isJson || typeof data !== 'string' || !plugin?.errors || this.getHeader('Content-Type'))
-        return defSend.call(this, data)
-      const errFile: string = plugin.errors[this.statusCode] || plugin.errors['*']
-      if (errFile)
-        plugin.serveFile(this.req, this, {path: errFile, mimeType: 'text/html'})
-      return defSend.call(this, data)
-    }
+    if (server && !server.getPlugin('static')) {
+      this.name = 'static' // only first plugin instance is registered as
 
-    ServerResponse.prototype.file = function (path: string | ServeFileOptions) {
-      const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
-      if (!plugin)
-        throw new Error('Server error')
-      plugin.serveFile(this.req, this, typeof path === 'object' ? path : {
-        path,
-        mimeType: StaticFilesPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
-      })
+      const defSend = ServerResponse.prototype.send
+
+      ServerResponse.prototype.send = function (data: any) {
+        const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
+        if (this.statusCode < 400 || this.isJson || typeof data !== 'string' || !plugin?.errors || this.getHeader('Content-Type'))
+          return defSend.call(this, data)
+        const errFile: string = plugin.errors[this.statusCode] || plugin.errors['*']
+        if (errFile)
+          plugin.serveFile(this.req, this, {path: errFile, mimeType: 'text/html'})
+        return defSend.call(this, data)
+      }
+
+      ServerResponse.prototype.file = function (path: string | ServeFileOptions) {
+        const plugin: StaticFilesPlugin = this.req.server.getPlugin('static') as StaticFilesPlugin
+        if (!plugin)
+          throw new Error('Server error')
+        plugin.serveFile(this.req, this, typeof path === 'object' ? path : {
+          path,
+          mimeType: StaticFilesPlugin.mimeTypes[extname(path)] || 'application/octet-stream'
+        })
+      }
     }
   }
 
