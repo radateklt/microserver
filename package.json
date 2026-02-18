@@ -1,6 +1,6 @@
 {
   "name": "@radatek/microserver",
-  "version": "3.0.3",
+  "version": "3.0.4",
   "description": "HTTP MicroServer",
   "author": "Darius Kisonas",
   "license": "MIT",
