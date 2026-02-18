@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.2
+ * @version 3.0.3
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -104,7 +104,7 @@ export abstract class Plugin {
 }
 
 interface PluginClass {
-  new(options?: any, server?: MicroServer): Plugin
+  new(options: any, server: MicroServer): Plugin
 }
 
 export type ServerRequestBody<T = any> = T extends Model<infer U extends ModelSchema> ? ModelDocument<U> : Record<string, any>
@@ -149,15 +149,15 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   /** Request raw body size */
   public rawBodySize!: number
 
-  _body?: ServerRequestBody<T>
-  _isReady: DeferPromise | undefined
+  private _body?: ServerRequestBody<T>
+  private _isReady: DeferPromise | undefined
   
-  private constructor (server: MicroServer) {
+  private constructor (res: http.ServerResponse, server: MicroServer) {
     super(new net.Socket())
-    ServerRequest.extend(this, server)
+    ServerRequest.extend(this, res, server)
   }
 
-  static extend(req: http.IncomingMessage, server: MicroServer): ServerRequest {
+  static extend(req: http.IncomingMessage, res: http.ServerResponse, server: MicroServer): ServerRequest {
     const reqNew = Object.setPrototypeOf(req, ServerRequest.prototype) as ServerRequest
     let ip = req.socket.remoteAddress || '::1';
     if (ip.startsWith('::ffff:'))
@@ -176,6 +176,15 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
       rawBody: [],
       rawBodySize: 0
     })
+    if (req.readable && !req.complete) {
+      reqNew._isReady = deferPromise((err) => {
+        reqNew._isReady = undefined
+        if (err && res && !res.headersSent) {
+          res.statusCode = 'statusCode' in err ? err.statusCode as number : 400
+          res.end(http.STATUS_CODES[res.statusCode] || 'Error')
+        }
+      })
+    }
     reqNew.updateUrl(req.url || '/')
     return reqNew
   }
@@ -190,6 +199,14 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
     const res: any = await this._isReady
     if (res && res instanceof Error)
       throw res
+  }
+
+  setReady(err?: Error): void {
+    this._isReady?.resolve(err)
+  }
+
+  setBody(body: ServerRequestBody<T>): void {
+    this._body = body
   }
 
   /** Update request url */
@@ -240,7 +257,8 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   public headersOnly!: boolean
 
   private constructor (server: MicroServer) {
-    super(ServerRequest.extend(new http.IncomingMessage(new net.Socket()), server))
+    super(new http.IncomingMessage(new net.Socket()))
+    ServerRequest.extend(this.req, this, server)
     ServerResponse.extend(this)
   }
 
@@ -681,18 +699,8 @@ export class MicroServer extends EventEmitter {
 
   /** Default server handler */
   handler (req: ServerRequest, res: ServerResponse): void {
-    ServerRequest.extend(req, this)
+    ServerRequest.extend(req, res, this)
     ServerResponse.extend(res)
-
-    if (req.readable) {
-      req._isReady = deferPromise((err) => {
-        req._isReady = undefined
-        if (err) {
-          if (!res.headersSent)
-            res.error('statusCode' in err ? err.statusCode as number : 400)
-        }
-      })
-    }
     this._router.walk(this._stack, req, res, () => res.error(404))
     //this.handlerRouter(req, res, () => this.handlerLast(req, res))
   }
@@ -1185,20 +1193,9 @@ export class BodyPlugin extends Plugin {
   handler(req: ServerRequest, res: ServerResponse, next: () => void) {
     if (req.complete || req.method === 'GET') {
       if (!req.body)
-        req._body = {} as any
+        req.setBody({})
       return next()
     }
-
-    req._isReady = deferPromise((err) => {
-      req._isReady = undefined
-      if (err) {
-        if (!req.complete)
-          req.pause()
-        if (!res.headersSent)
-          res.error('statusCode' in err ? err.statusCode as number : 400)
-      } else if (req.complete)
-        res.removeHeader('Connection')
-    })
 
     const contentType = req.headers['content-type'] || ''
     if (contentType.startsWith('multipart/form-data')) {
@@ -1208,42 +1205,33 @@ export class BodyPlugin extends Plugin {
     }
 
     if (parseInt(req.headers['content-length'] || '-1') > this._maxBodySize) {
-      return req._isReady?.resolve(new ResponseError("too big", 413))
+      return req.setReady(new ResponseError("too big", 413))
     }
 
     req.once('error', () => {})
       .on('data', chunk => {
         req.rawBodySize += chunk.length
         if (req.rawBodySize >= this._maxBodySize)
-          req._isReady?.resolve(new ResponseError("too big", 413))
+          req.setReady(new ResponseError("too big", 413))
         else
           req.rawBody.push(chunk)
       })
       .once('end', () => {
-        req._isReady?.resolve()
-        Object.defineProperty(req, 'body', {
-          get: () => {
-            if (!req._body) {
-              let charset = contentType.match(/charset=(\S+)/)?.[1]
-              if (charset !== 'utf8' && charset !== 'latin1' && charset !== 'ascii')
-                charset = 'utf8'
-              const bodyString = Buffer.concat(req.rawBody).toString(charset as BufferEncoding)
-              if (contentType.startsWith('application/x-www-form-urlencoded')) {
-                req._body = querystring.parse(bodyString)
-              } else if (bodyString.startsWith('{') || bodyString.startsWith('[')) {
-                try {
-                  req._body = JSON.parse(bodyString)
-                } catch {
-                  return res.jsonError(405)
-                }
-              } else
-                req._body = {}
-            }
-            return req._body
-          },
-          configurable: true,
-          enumerable: true
-        })
+        let charset = contentType.match(/charset=(\S+)/)?.[1]
+        if (charset !== 'utf8' && charset !== 'latin1' && charset !== 'ascii')
+          charset = 'utf8'
+        const bodyString = Buffer.concat(req.rawBody).toString(charset as BufferEncoding)
+        if (contentType.startsWith('application/x-www-form-urlencoded')) {
+          req.setBody(querystring.parse(bodyString))
+        } else if (bodyString.startsWith('{') || bodyString.startsWith('[')) {
+          try {
+            req.setBody(JSON.parse(bodyString))
+          } catch {
+            return res.jsonError(405)
+          }
+        } else
+          req.setBody({})
+        req.setReady()
         return next()
       })
   }
@@ -1282,19 +1270,6 @@ export class UploadPlugin extends Plugin {
     const contentType = req.headers['content-type'] || ''
     if (!contentType.startsWith('multipart/form-data'))
       return next()
-
-    if (!req._isReady) {
-      req._isReady = deferPromise((err) => {
-        req._isReady = undefined
-        if (err) {
-          req.pause()
-          if (!res.headersSent)
-          res.setHeader('Connection', 'close')
-          res.error('statusCode' in err ? err.statusCode as number : 400)
-        } else
-          res.removeHeader('Connection')
-      })
-    }
 
     req.pause()
     res.setHeader('Connection', 'close')
@@ -1370,7 +1345,7 @@ export class UploadPlugin extends Plugin {
             fileStream = undefined
             if (buffer[nextBoundaryIndexEnd] === 45) {
               res.removeHeader('Connection')
-              req._isReady?.resolve()
+              req.setReady()
             }
             buffer = buffer.subarray(nextBoundaryIndex)
           } else {
@@ -1388,7 +1363,7 @@ export class UploadPlugin extends Plugin {
 
     const _removeTempFiles = () => {
       if (!req.isReady)
-        req._isReady?.resolve(new Error('Upload error'))
+        req.setReady(new Error('Upload error'))
       if (fileStream) {
         fileStream.close()
         fileStream = undefined
@@ -1400,13 +1375,13 @@ export class UploadPlugin extends Plugin {
         delete f.filePath
       })
       files.splice(0)
-      req._isReady?.resolve()
+      req.setReady()
     }
 
     next()
-    req.once('error', () => req._isReady?.resolve(new Error('Upload error')))
+    req.once('error', () => req.setReady(new Error('Upload error')))
       .on('data', chunk => chunkParse(chunk))
-      .once('end', () => req._isReady?.resolve(new Error('Upload error')))
+      .once('end', () => req.setReady(new Error('Upload error')))
 
     res.once('finish', () => _removeTempFiles())
     res.once('error', () => _removeTempFiles())
@@ -1495,10 +1470,13 @@ export class WebSocket extends EventEmitter {
       this._options.deflate = true
     }
     this.ready = true
-    this._upgrade(key, headers)
+    this._upgrade(key, headers, () => {
+      req.setReady()
+      this.emit('open')
+    })
   }
 
-  private _upgrade (key: string, headers: string[] = []) {
+  private _upgrade (key: string, headers: string[] = [], cb?: () => void): void {
     const digest = crypto.createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
       .digest('base64');
@@ -1512,7 +1490,7 @@ export class WebSocket extends EventEmitter {
       '',
       ''
     ];
-    this._socket.write(headers.join('\r\n'))
+    this._socket.write(headers.join('\r\n'), cb)
     this._socket.on('error',this._errorHandler.bind(this))
     this._socket.on('data', this._dataHandler.bind(this))
     this._socket.on('close', () => this.emit('close'))
@@ -1792,12 +1770,11 @@ export class WebSocketPlugin extends Plugin {
   }
 
   upgradeHandler (server: MicroServer, req: ServerRequest, socket: net.Socket, head: any) {
-    ServerRequest.extend(req, server)
     const host: string = req.headers.host || ''
     const vhostPlugin = server.getPlugin('vhost') as VHostPlugin
     const vserver = vhostPlugin?.vhosts?.[host] || server
     req.method = 'WEBSOCKET'
-    const res = {
+    const res: any = {
       req,
       get headersSent (): boolean {
         return socket.bytesWritten > 0
@@ -1805,7 +1782,7 @@ export class WebSocketPlugin extends Plugin {
       statusCode: 200,
       socket,
       server,
-      write (data?: string): void {
+      end (data?: string): void {
         if (res.headersSent)
           throw new Error('Headers already sent')
         let code = res.statusCode || 403
@@ -1819,7 +1796,7 @@ export class WebSocketPlugin extends Plugin {
         const headers: string[] = [
           `HTTP/1.1 ${code} ${http.STATUS_CODES[code]}`,
           'Connection: close',
-          'Content-Type: text/html',
+          'Content-Type: text/plain',
           `Content-Length: ${Buffer.byteLength(data)}`,
           '',
           data
@@ -1828,23 +1805,25 @@ export class WebSocketPlugin extends Plugin {
       },
       error (code: number): void {
         res.statusCode = code || 403
-        res.write()
-      },
-      end (data?: string): void {
-        res.write(data)
+        res.end()
       },
       send (data?: string): void {
-        res.write(data)
+        res.end(data)
       },
       getHeader (): undefined { },
       setHeader (): void { }
     }
-    vserver.handler(req, res as unknown as ServerResponse)
-    //vserver.handlerRouter(req, res as unknown as ServerResponse, () => res.error(404))
-  }
-
-  static create (req: ServerRequest, options?: WebSocketOptions): WebSocket {
-    return new WebSocket(req, options)
+    ServerRequest.extend(req, res as any, server)
+    let _ws: WebSocket | undefined
+    Object.defineProperty(req, 'websocket', {
+      get: () => {
+        if (!_ws)
+          _ws = new WebSocket(req, server.config.websocket)
+        return _ws
+      },
+      enumerable: true
+    })
+    vserver.handler(req, res as ServerResponse)
   }
 }
 // #endregion WebSocket
