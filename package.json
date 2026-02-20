@@ -18,7 +18,6 @@
   },
   "scripts": {
     "prepublishOnly": "pnpm build",
-    "build1": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --outDir dist && sed -Ei 's/\\\"use strict\\\";\\n\\n//g' dist/microserver.js && sed -Ei ':a;N;$!ba;s/\\n +private _[^\\n]+//g;s/export \\{\\};//g' dist/microserver.d.ts; sed -E ':a;N;$!ba;s|\"main\"[^\\n]+|\"main\": \"microserver.js\",\\n  \"module\": \"microserver.js\",\\n  \"types\": \"microserver.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json > dist/package.json && cp README.md dist/",
     "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --stripInternal --outDir dist && sed -E ':a;N;$!ba;s|\"main\":\\s*\"([^\"]+)\\.ts\"[^\\n]*|\"main\": \"\\1.js\",\\n  \"module\": \"\\1.js\",\\n  \"types\": \"\\1.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json > dist/package.json && cp README.md dist/",
     "test": "node test.ts"
   },
