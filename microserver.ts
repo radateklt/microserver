@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.5
+ * @version 3.0.6
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -149,9 +149,12 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   /** Request raw body size */
   public rawBodySize!: number
 
+  // @internal
   private _body?: ServerRequestBody<T>
+  // @internal
   private _isReady: DeferPromise | undefined
   
+  // @internal
   private constructor (res: http.ServerResponse, server: MicroServer) {
     super(new net.Socket())
     ServerRequest.extend(this, res, server)
@@ -260,6 +263,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   /** Should response be json */
   public isJson!: boolean
 
+  // @internal
   private constructor (server: MicroServer) {
     super(new http.IncomingMessage(new net.Socket()))
     ServerRequest.extend(this.req, this, server)
@@ -464,9 +468,13 @@ export class MicroServer extends EventEmitter {
   /** Authorization object */
   public auth?: Auth
 
+  // @internal
   private _plugins: Record<string, Plugin> = {}
+  // @internal
   private _stack: Middleware[] = []
+  // @internal
   private _router: RouterPlugin = new RouterPlugin()
+  // @internal
   private _worker: Worker = new Worker()
   
   /** All sockets */
@@ -607,6 +615,7 @@ export class MicroServer extends EventEmitter {
   }
 
   /* bind middleware or create one from string like: 'redirect:302,https://redirect.to', 'error:422', 'param:name=value', 'acl:users/get', 'model:User', 'group:Users', 'user:admin' */
+  // @internal
   private _bind (fn: RoutesMiddleware): Function {
     if (typeof fn === 'string') {
       let name = fn
@@ -807,6 +816,7 @@ export class MicroServer extends EventEmitter {
     return this._worker.endJob()
   }
 
+  // @internal
   private async _plugin(plugin: Plugin): Promise<void> {
     if (plugin.handler) {
       const middleware: Middleware = plugin.handler.bind(plugin)
@@ -948,11 +958,17 @@ export interface ListenConfig {
 
 // #region RouterPlugin
 class RouterItem {
+  // @internal
   _stack?: Middleware[] // add if middlewares added if not last
+  // @internal
   _next?: Record<string, RouterItem> // next middlewares
+  // @internal
   _paramName?: string // param name if param is used
+  // @internal
   _paramWild?: boolean
+  // @internal
   _withParam?: RouterItem // next middlewares if param is used
+  // @internal
   _last?: Middleware[]
 }
 
@@ -960,7 +976,9 @@ class RouterPlugin extends Plugin {
   priority = 100
   name = 'router'
 
+  // @internal
   private _tree: Record<string, RouterItem> = {}
+  
   constructor () {
     super()
   }
@@ -1010,6 +1028,7 @@ class RouterPlugin extends Plugin {
     }
   }
 
+  // @internal
   private _getStack(path: string, treeItems: string[]): Middleware[] {
     const out: Middleware[] = []
     const segments = path.split('/').filter(s => s)
@@ -1149,8 +1168,11 @@ export class MethodsPlugin extends Plugin {
   priority = -90
   name = 'methods'
 
+  // @internal
   private _methods: string
+  // @internal
   private _methodsIdx: Record<string, boolean>
+  
   constructor(methods?: string) {
     super()
 
@@ -1182,7 +1204,9 @@ export class BodyPlugin extends Plugin {
   priority: number = -80
   name: string = 'body'
 
+  // @internal
   private _maxBodySize: number
+  
   constructor (options?: BodyOptions) {
     super()
     this._maxBodySize = options?.maxBodySize || defaultMaxBodySize
@@ -1254,8 +1278,11 @@ export class UploadPlugin extends Plugin {
   priority: number = -70
   name: string = 'upload'
 
+  // @internal
   private _maxFileSize: number
+  // @internal
   private _uploadDir?: string
+  
   constructor (options?: UploadOptions) {
     super()
     this._maxFileSize = options?.maxFileSize || defaultMaxFileSize
@@ -1350,6 +1377,10 @@ export class UploadPlugin extends Plugin {
             const safeWriteLength = buffer.length - lookahead
             if (safeWriteLength > 0) {
               lastFile!.size += safeWriteLength
+              if (lastFile!.size > this._maxFileSize) {
+                req.setReady(new ResponseError("file too big", 413))
+                return
+              }
               fileStream.write(buffer.subarray(0, safeWriteLength))
               buffer = buffer.subarray(safeWriteLength)
             }
@@ -1431,11 +1462,17 @@ interface WebSocketEvents {
 
 /** WebSocket class */
 export class WebSocket extends EventEmitter {
+  // @internal
   private _socket: net.Socket
+  // @internal
   private _frame?: WebSocketFrame
+  // @internal
   private _buffers: Buffer[] = [EMPTY_BUFFER]
+  // @internal
   private _buffersLength: number = 0
+  // @internal
   private _options: WebSocketOptions
+  
   public ready: boolean = false
 
   constructor (req: ServerRequest, options?: WebSocketOptions) {
@@ -1456,7 +1493,7 @@ export class WebSocket extends EventEmitter {
     const extensions: string | undefined = req.headers['sec-websocket-extensions']
     const headers: string[] = []
 
-    if (!key || !upgrade || upgrade.toLocaleLowerCase() !== 'websocket' || version !== 13 || req.method !== 'GET') {
+    if (!key || upgrade?.toLocaleLowerCase() !== 'websocket' || version !== 13) {
       this._abort('Invalid WebSocket request', 400)
       return
     }
@@ -1467,13 +1504,13 @@ export class WebSocket extends EventEmitter {
       headers.push(header)
       this._options.deflate = true
     }
-    this.ready = true
     this._upgrade(key, headers, () => {
-      req.setReady()
+      this.ready = true
       this.emit('open')
     })
   }
 
+  // @internal
   private _upgrade (key: string, headers: string[] = [], cb?: () => void): void {
     const digest = crypto.createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
@@ -1507,45 +1544,6 @@ export class WebSocket extends EventEmitter {
     return this._sendFrame(0x88, data || EMPTY_BUFFER, () => this._socket.destroy())
   }
 
-  /** Generate WebSocket frame from data */
-  static getFrame(data: number | string | Buffer | undefined, options?: any): Buffer {
-    let msgType: number = 8
-    let dataLength: number = 0
-    if (typeof data === 'string') {
-      msgType = 1
-      dataLength = Buffer.byteLength(data, 'utf8')
-    } else if (data instanceof Buffer) {
-      msgType = 2
-      dataLength = data.length
-    } else if (typeof data === 'number') {
-      msgType = data
-    }
-
-    const headerSize: number = 2 + (dataLength < 126 ? 0 : dataLength < 65536 ? 2 : 8) + (dataLength && options?.mask ? 4 : 0)
-    const frame: Buffer = Buffer.allocUnsafe(headerSize + dataLength)
-    frame[0] = 0x80 | msgType
-    frame[1] = dataLength > 65535 ? 127 : dataLength > 125 ? 126 : dataLength
-    if (dataLength > 65535)
-      frame.writeBigUInt64BE(dataLength as unknown as bigint, 2)
-    else if (dataLength > 125)
-      frame.writeUInt16BE(dataLength, 2)
-    if (dataLength && frame.length > dataLength) {
-      if (typeof data === 'string')
-        frame.write(data, headerSize, 'utf8')
-      else
-        (data as Buffer).copy(frame, headerSize)
-    }
-    if (dataLength && options?.mask) {
-      let i:number = headerSize, h:number = headerSize - 4
-      for (let i = 0; i < 4; i++)
-        frame[h + i] = Math.floor(Math.random() * 256)
-      for (let j: number = 0; j < dataLength; j++, i++) {
-        frame[i] ^= frame[h + (j & 3)]
-      }
-    }
-    return frame
-  }
-
   /** Send data */
   send (data: string | Buffer): void {
     let msgType: number = typeof data === 'string' ? 1 : 2
@@ -1567,6 +1565,7 @@ export class WebSocket extends EventEmitter {
       return this._sendFrame(0x80 | msgType, data)
   }
 
+  // @internal
   private _errorHandler (error: Error): void {
     this.emit('error', error)
     if (this.ready)
@@ -1576,6 +1575,7 @@ export class WebSocket extends EventEmitter {
     this.ready = false
   }
 
+  // @internal
   private _headerLength (buffer?: Buffer): number {
     if (this._frame)
       return 0
@@ -1585,6 +1585,7 @@ export class WebSocket extends EventEmitter {
     return 2 + (hederInfo & 0x80 ? 4 : 0) + ((hederInfo & 0x7F) === 126 ? 2 : 0) + ((hederInfo & 0x7F) === 127 ? 8 : 0)
   }
 
+  // @internal
   private _dataHandler (data: Buffer): void {
     while (data.length) {
       let frame: WebSocketFrame | undefined = this._frame
@@ -1694,6 +1695,7 @@ export class WebSocket extends EventEmitter {
     }
   }
 
+  // @internal
   private _abort (message?: string, code?: number, headers?: any) {
     code = code || 400
     message = message || http.STATUS_CODES[code] || 'Closed'
@@ -1723,6 +1725,7 @@ export class WebSocket extends EventEmitter {
     this._sendFrame(0x8A, buffer || EMPTY_BUFFER)
   }
 
+  // @internal
   private _sendFrame (opcode: number, data: Buffer, cb?: () => void) {
     if (!this.ready)
       return
@@ -1742,27 +1745,35 @@ export class WebSocket extends EventEmitter {
       this._socket.write(frame, () => this._socket.write(data, cb))
   }
 
-  on<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this { return super.on(event, listener) }
-  addListener<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this { return super.addListener(event, listener) }
-  once<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this { return super.once(event, listener) }
-  off<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K] ): this { return super.off(event, listener) }
-  removeListener<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this { return super.removeListener(event, listener) }
+  // @ts-ignore
+  on<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this; // { return super.on(event, listener) }
+  // @ts-ignore
+  addListener<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this; // { return super.addListener(event, listener) }
+  // @ts-ignore
+  once<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this; // { return super.once(event, listener) }
+  // @ts-ignore
+  off<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K] ): this; // { return super.off(event, listener) }
+  // @ts-ignore
+  removeListener<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this; // { return super.removeListener(event, listener) }
 }
 
 export class WebSocketPlugin extends Plugin {
   name: string = 'websocket'
   
+  // @internal
   private _handler: (req: ServerRequest, socket: net.Socket, head: any) => void
+  
   constructor (options?: any, server?: MicroServer) {
     super()
     if (!server)
       throw new Error('Server instance is required')
     this._handler = this.upgradeHandler.bind(this, server)
-    server.servers?.forEach(srv => this.addUpgradeHandler(srv as any))
-    server.on('listen', (port: number, address: string, srv: http.Server) => this.addUpgradeHandler(srv))
+    server.servers?.forEach(srv => this._addUpgradeHandler(srv as any))
+    server.on('listen', (port: number, address: string, srv: http.Server) => this._addUpgradeHandler(srv))
   }
 
-  private addUpgradeHandler (srv: http.Server) {
+  // @internal
+  private _addUpgradeHandler (srv: http.Server) {
     if (!srv.listeners('upgrade').includes(this._handler as any))
       srv.on('upgrade', this._handler)
   }
@@ -1771,7 +1782,6 @@ export class WebSocketPlugin extends Plugin {
     const host: string = req.headers.host || ''
     const vhostPlugin = server.getPlugin('vhost') as VHostPlugin
     const vserver = vhostPlugin?.vhosts?.[host] || server
-    req.method = 'WEBSOCKET'
     const res: any = {
       req,
       get headersSent (): boolean {
@@ -1802,7 +1812,9 @@ export class WebSocketPlugin extends Plugin {
         socket.write(headers.join('\r\n'), () => { socket.destroy() });
       },
       error (code: number): void {
-        res.statusCode = code || 403
+        if (typeof code !== 'number')
+          code = 405
+        res.statusCode = code || 405
         res.end()
       },
       send (data?: string): void {
@@ -1812,15 +1824,18 @@ export class WebSocketPlugin extends Plugin {
       setHeader (): void { }
     }
     ServerRequest.extend(req, res as any, server)
-    let _ws: WebSocket | undefined
+    let ws: WebSocket | undefined
     Object.defineProperty(req, 'websocket', {
       get: () => {
-        if (!_ws)
-          _ws = new WebSocket(req, server.config.websocket)
-        return _ws
+        if (!ws)
+          ws = new WebSocket(req, server.config.websocket)
+        return ws
       },
       enumerable: true
     })
+    if (req.method !== 'GET' || req.headers.upgrade?.toLowerCase() !== 'websocket')
+      return res.error(400)
+    req.method = 'WEBSOCKET'
     vserver.handler(req, res as ServerResponse)
   }
 }
@@ -1832,7 +1847,9 @@ export class TrustProxyPlugin extends Plugin {
   priority: number = -60
   name: string = 'trustproxy'
 
+  // @internal
   private _trustProxy: string[] = []
+
   constructor (options?: string[]) {
     super()
     this._trustProxy = options || []
@@ -1865,6 +1882,7 @@ export class VHostPlugin extends Plugin {
   priority = -10
 
   vhosts?: Record<string, MicroServer>
+
   constructor (options: Record<string, RoutesSet|MicroServer>, server?: MicroServer) {
     super()
     if (!server)
@@ -2420,11 +2438,7 @@ export class Auth {
     return encrypted.replace(/==?/, '').replace(/\//g, '.').replace(/\+/g, '-')
   }
 
-  /**
-   * Check acl over authenticated user with: `id`, `group/*`, `*`
-   * @param {string} id - to authenticate: `id`, `group/id`, `model/action`, comma separated best: true => false => def 
-   * @param {boolean} [def=false] - default access
-   */
+  /** Check acl over authenticated user with: `id`, `group/*`, `*` */
   acl (id: string, def: boolean = false): boolean {
     if (!this.req?.user)
       return false
@@ -2448,12 +2462,7 @@ export class Auth {
     return access ?? def
   }
 
-  /**
-     * Authenticate user and setup cookie
-     * @param {string|UserInfo} usr - user id used with options.users to retrieve user object. User object must contain `id` and `acl` object (Ex. usr = {id:'usr', acl:{'users/*':true}})
-     * @param {string} [psw] - user password (if used for user authentication with options.users)
-     * @param {number} [expire] - expire time in seconds (default: options.expire)
-     */
+  /** Generate token from user info */
   async token (usr: string | UserInfo | undefined, psw: string | undefined, expire?: number): Promise<string | undefined> {
     let data: string | undefined
     if (typeof usr === 'object' && usr && (usr.id || usr._id))
@@ -2469,9 +2478,7 @@ export class Auth {
       return this.encode(data, expire)
   }
 
-  /**
-   * Authenticate user and setup cookie
-   */
+  /** Authenticate user and setup cookie */
   async login (usr: string | UserInfo | undefined, psw?: string, options?: {expire?: number, salt?: string}): Promise<UserInfo | undefined> {
     let usrInfo: UserInfo | undefined
     if (typeof usr === 'object')
@@ -2978,7 +2985,9 @@ export class Controller<T extends Model<any> = any> {
 
 // #region Worker
 class WorkerJob {
+  // @internal
   _promises: any = []
+  // @internal
   _busy: number = 0
 
   start() {
@@ -3000,7 +3009,9 @@ class WorkerJob {
 }
 
 class Worker {
+  // @internal
   private _id: number = 0
+  // @internal
   private _jobs: Record<string, WorkerJob> = {}
 
   isBusy(id?: string) {
@@ -3054,11 +3065,17 @@ interface FileItem {
 
 /** JSON File store */
 export class FileStore {
+  // @internal
   private _cache: { [name: string]: FileItem }
+  // @internal
   private _dir: string
+  // @internal
   private _cacheTimeout: number
+  // @internal
   private _cacheItems: number
+  // @internal
   private _debounceTimeout: number
+  // @internal
   private _iter: number
 
   constructor (options?: FileStoreOptions) {
@@ -3085,8 +3102,10 @@ export class FileStore {
     }
   }
 
+  // @internal
   private _queue: Promise<any> = Promise.resolve()
 
+  // @internal
   private async _sync(cb: Function): Promise<any> {
     let r: Function
     let p: Promise<any> = new Promise(resolve => r = resolve)
@@ -3407,8 +3426,11 @@ export declare interface ModelCollections {
 }
 
 class ModelCollectionsInternal implements ModelCollections {
+  // @internal
   private _ready!: Function
+  // @internal
   private _wait: Promise<this> = new Promise(resolve => this._ready = resolve)
+  // @internal
   private _db: any
   set db(db: any) {
     Promise.resolve(db).then(db => this._ready(this._db = db))
@@ -3716,6 +3738,7 @@ export class Model<TSchema extends ModelSchema> {
     return res as ModelDocument<TSchema>
   }
 
+  // @internal
   private _fieldFunction(value: any, def?: any): ModelCallbackFunc {
     if (typeof value === 'string' && value.startsWith('${') && value.endsWith('}')) {
       const names = value.slice(2, -1).split('.')
@@ -3734,6 +3757,7 @@ export class Model<TSchema extends ModelSchema> {
     return () => value
   }
 
+  // @internal
   private _validateField (value: any, options: ModelValidateFieldOptions): any {
     const field: ResolvedFieldSchema = options.field
     if (value == null) {
@@ -3905,7 +3929,9 @@ export declare interface FindOptions {
 
 /** Collection factory */
 export class MicroCollectionStore {
+  // @internal
   private _collections: Map<string, MicroCollection> = new Map()
+  // @internal
   private _store?: FileStore
 
   constructor (dataPath?: string, storeTimeDelay?: number) {
@@ -3931,6 +3957,7 @@ export class MicroCollection<TSchema extends ModelSchema = any> {
   public name: string
   /** Collection data */
   public data: Record<string, ModelDocument<TSchema>>
+  // @internal
   private _save?: (id: string, doc: ModelDocument<TSchema> | undefined, col: MicroCollection) => Promise<ModelDocument<TSchema>>
 
   constructor(options: MicroCollectionOptions<TSchema> = {}) {
