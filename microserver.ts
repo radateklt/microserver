@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.6
+ * @version 3.0.7
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -100,7 +100,6 @@ export abstract class Plugin {
   priority?: number
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
-  constructor() { }
 }
 
 interface PluginClass {
@@ -154,8 +153,7 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   // @internal
   private _isReady: DeferPromise | undefined
   
-  // @internal
-  private constructor (res: http.ServerResponse, server: MicroServer) {
+  protected constructor (res: http.ServerResponse, server: MicroServer) {
     super(new net.Socket())
     ServerRequest.extend(this, res, server)
   }
@@ -263,8 +261,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   /** Should response be json */
   public isJson!: boolean
 
-  // @internal
-  private constructor (server: MicroServer) {
+  protected constructor (server: MicroServer) {
     super(new http.IncomingMessage(new net.Socket()))
     ServerRequest.extend(this.req, this, server)
     ServerResponse.extend(this)
@@ -453,7 +450,7 @@ export interface MicroServerConfig extends ListenConfig {
   [key: string]: any
 }
 
-interface MicroServerEvents {
+export interface MicroServerEvents {
   ready: () => void
   close: () => void
   listen: (port: number, address: string, server: http.Server) => void
@@ -972,6 +969,7 @@ class RouterItem {
   _last?: Middleware[]
 }
 
+/** Router plugin */
 class RouterPlugin extends Plugin {
   priority = 100
   name = 'router'
@@ -1128,6 +1126,7 @@ export interface CorsOptions {
   maxAge?: number
 }
 
+/** CORS plugin. Config may be: true - allow all, string - allow specific origin, or CorsOptions */
 export class CorsPlugin extends Plugin {
   priority = -100
   name = 'cors'
@@ -1164,6 +1163,7 @@ export class CorsPlugin extends Plugin {
 // #enregion CorsPlugin
 
 // #region MethodsPlugin
+/** Methods plugin to support OPTIONS method, and restrict allowed methods. Configuration is comma separated string  */
 export class MethodsPlugin extends Plugin {
   priority = -90
   name = 'methods'
@@ -1200,6 +1200,8 @@ export class MethodsPlugin extends Plugin {
 export interface BodyOptions {
   maxBodySize?: number
 }
+
+/** Body parser plugin */
 export class BodyPlugin extends Plugin {
   priority: number = -80
   name: string = 'body'
@@ -1274,6 +1276,7 @@ export interface UploadFile {
   filePath?: string
 }
 
+/** Upload plugin, At least uploadDir option is required */
 export class UploadPlugin extends Plugin {
   priority: number = -70
   name: string = 'upload'
@@ -1460,7 +1463,7 @@ interface WebSocketEvents {
   open: () => void;
 }
 
-/** WebSocket class */
+/** WebSocket class used in upgrade handler */
 export class WebSocket extends EventEmitter {
   // @internal
   private _socket: net.Socket
@@ -1757,6 +1760,7 @@ export class WebSocket extends EventEmitter {
   removeListener<K extends keyof WebSocketEvents>(event: K, listener: WebSocketEvents[K]): this; // { return super.removeListener(event, listener) }
 }
 
+/** WebSocket plugin to support `WEBSOCKET /url` routes */
 export class WebSocketPlugin extends Plugin {
   name: string = 'websocket'
   
@@ -1780,8 +1784,6 @@ export class WebSocketPlugin extends Plugin {
 
   upgradeHandler (server: MicroServer, req: ServerRequest, socket: net.Socket, head: any) {
     const host: string = req.headers.host || ''
-    const vhostPlugin = server.getPlugin('vhost') as VHostPlugin
-    const vserver = vhostPlugin?.vhosts?.[host] || server
     const res: any = {
       req,
       get headersSent (): boolean {
@@ -1836,7 +1838,7 @@ export class WebSocketPlugin extends Plugin {
     if (req.method !== 'GET' || req.headers.upgrade?.toLowerCase() !== 'websocket')
       return res.error(400)
     req.method = 'WEBSOCKET'
-    vserver.handler(req, res as ServerResponse)
+    server.handler(req, res as ServerResponse)
   }
 }
 // #endregion WebSocket
@@ -1948,6 +1950,8 @@ export interface StaticFilesOptions {
   maxAge?: number
   /** static errors file for status code, '*' - default */
   errors?: Record<string, string>
+  /** check precompressed file */
+  precompressedGzip?: boolean
 }
 
 export interface ServeFileOptions {
@@ -1973,14 +1977,7 @@ export interface ServeFileOptions {
 
 const etagPrefix = crypto.randomBytes(4).toString('hex')
 
-//TODO: add precompressed .gz support
-//TODO: add unknown file extension handler
-
-/**
- * Static files middleware plugin
- * Usage: server.use('static', '/public')
- * Usage: server.use('static', { root: 'public', path: '/static' })
- */
+/** Static files plugin. At least must be path to public folder as string or StaticFilesOptions */
 export class StaticFilesPlugin extends Plugin {
   priority: number = 110
   
@@ -2028,6 +2025,7 @@ export class StaticFilesPlugin extends Plugin {
   prefix: string
 
   errors?: Record<string, string>
+  checkPrecompressedGzip?: boolean
 
   constructor (options?: StaticFilesOptions | string, server?: MicroServer) {
     super()
@@ -2045,10 +2043,9 @@ export class StaticFilesPlugin extends Plugin {
     this.etag = options.etag !== false
     this.maxAge = options.maxAge
     this.errors = options.errors
+    this.checkPrecompressedGzip = options.precompressedGzip
 
     this.prefix = ('/' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '')).replace(/\/$/, '')
-
-    const defSend = ServerResponse.prototype.send
 
     if (server && !server.getPlugin('static')) {
       this.name = 'static' // only first plugin instance is registered as
@@ -2120,11 +2117,26 @@ export class StaticFilesPlugin extends Plugin {
         return handler.call(this, req, res, next)
       }
 
-      this.serveFile(req, res, {
-        path: filename,
-        mimeType,
-        stats
-      })
+      if (this.checkPrecompressedGzip && (req.headers['accept-encoding'] || '').includes('gzip')) {
+        const gzipped = filename + '.gz'
+        fs.stat(gzipped, (err, statsGz) => {
+          if (!err && statsGz.isFile()) {
+            res.setHeader('Content-Encoding', 'gzip')
+            filename = gzipped
+            stats = statsGz
+          }
+          this.serveFile(req, res, {
+            path: filename,
+            mimeType,
+            stats
+          })
+        })
+      } else
+        this.serveFile(req, res, {
+          path: filename,
+          mimeType,
+          stats
+        })
     })
   }
 
@@ -2199,9 +2211,9 @@ export interface ProxyOptions {
   validHeaders?: { [key: string]: boolean }
 }
 
+/** Reverse proxy plugin, At least remote url as string or in ProxyOptions is required */
 export class ProxyPlugin extends Plugin {
   priority = 120
-  name = 'proxy'
 
   /** Default valid headers */
   static validHeaders: { [key: string]: boolean } = {
@@ -2237,6 +2249,9 @@ export class ProxyPlugin extends Plugin {
       options = { remote: options }
     if (!options.remote)
       throw new Error('Invalid param')
+
+    if (server && !server.getPlugin('proxy'))
+      this.name = 'proxy'
 
     this.remoteUrl = new URL(options.remote)
     this.regex = options.match ? new RegExp(options.match) : undefined
@@ -2771,6 +2786,7 @@ export class AuthPlugin extends Plugin {
 }
 // #endregion AuthPlugin
 
+/** Load standard plugins with predefined configs: MethodsPlugin, CorsPlugin, TrustProxyPlugin, BodyPlugin, AuthPlugin, StaticFilesPlugin */
 export class StandardPlugins extends Plugin {
   constructor (options?: any, server?: MicroServer) {
     super()
@@ -2786,9 +2802,9 @@ export class StandardPlugins extends Plugin {
     use(MethodsPlugin)
     use(CorsPlugin, 'cors')
     use(TrustProxyPlugin, 'trustproxy')
+    use(AuthPlugin, 'auth')
     use(BodyPlugin)
     use(StaticFilesPlugin, 'static')
-    use(AuthPlugin, 'auth')
   }
 }
 
@@ -3294,7 +3310,7 @@ function newObjectId() {
 }
 
 /** Model validation options */
-interface ModelContextOptions {
+export interface ModelContextOptions {
   /** User info */
   user?: UserInfo
   /** Request params */
@@ -3313,13 +3329,13 @@ interface ModelContextOptions {
   projection?: Record<string, 0|1|true|false>
 }
 /** Model field validation options */
-interface ModelValidateFieldOptions extends ModelContextOptions {
+export interface ModelValidateFieldOptions extends ModelContextOptions {
   name: string
   field: ResolvedFieldSchema
   model: Model<any>
 }
 
-export interface ModelCallbackFunc {
+interface ModelCallbackFunc {
   (options: any): any
 }
 
@@ -3358,7 +3374,7 @@ export interface ModelFieldSchema {
   format?: string
 }
 
-interface ResolvedFieldSchema {
+export interface ResolvedFieldSchema {
   type: string
   model?: Model<any>
   primaryKey?: boolean
@@ -3449,8 +3465,8 @@ export class Models {
 
 export class Model<TSchema extends ModelSchema> {
   static collections: ModelCollections = new ModelCollectionsInternal()
-  static models: Models = {} as Models
-
+  static models: Models = new Models()
+  
   static set db(db: any) {
     (this.collections as ModelCollectionsInternal).db = db
   }
