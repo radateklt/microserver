@@ -7,28 +7,33 @@ const test: {
   (name: string, fn?: Function): void
   skip: (name: string, ...args: any) => void
   mode: (mode: 'stop' | 'continue') => void
+  after: (fn: Function) => void
   run: () => Promise<void>
 } = ((global: any) => {
-  let tests: {name: string, fn?: Function}[] = [], _mode: 'stop' | 'skip' | 'continue' = 'continue', _skip: boolean, _run: boolean
+  let tests: {name: string, fn?: Function}[] = [], _mode: 'stop' | 'skip' | 'continue' = 'continue', _skip: boolean, _run: boolean, _after: Function | undefined
   const test = (name: string, fn?: Function) => {
     tests.push({ name, fn })
     !_run && tests.length === 1 && process.nextTick(test.run)
   }
-  test.skip = (name: string, ...args: any) => name ? test(name) : _skip = true
+  test.skip = (name: string, ...args: any[]) => name ? test(name) : _skip = true
   test.mode = (mode: 'stop' | 'skip' | 'continue') => _mode = mode
+  test.after = (fn: Function) => _after = fn
   test.run = async () => {
     if (_run) return
     const {log, error, warn} = console
     _run = true
-    let count = 0, fail = 0, lastError: Error | undefined 
+    let count = 0, fail = 0, lastError: Error | undefined
+    const after = async () => { try { await _after?.() } catch (e: any) { error(e.stack) } _after = undefined }
     const run = async (prefix: string) => {
       for (const {name, fn} of tests) {
         const stime = performance.now(), out = (pre: string, msg?: string, post?: string) => log(`${prefix}\x1b[${pre} ${name}${msg?': '+msg:''}\x1b[90m (${post||(performance.now() - stime).toFixed(1)+'ms'})\x1b[0m`)
         try {
           count++
           tests = []
-          if (!(_skip = !fn))
+          if (!(_skip = !fn)) {
             await fn()
+            await after()
+          }
           if (_skip) {
             out('90m—', '', 'skipped')
             count--
@@ -44,6 +49,7 @@ const test: {
           fail++
           out('31m✘', e.message)
           e.name !== 'AssertionError' && error(e.stack);
+          await after()
           lastError = e
           if (_mode !== 'continue')
             return
@@ -508,7 +514,7 @@ test('Model store', async () => {
 })
 
 test('FileStore', async () => {
-  const store = new FileStore({dir: './tmp', debounceTimeout: 200})
+  const store = new FileStore({dir: './tmp', debounceTime: 200})
   await fs.writeFile('./tmp/test', JSON.stringify({name: 'test'}))
   const data = await store.load('test', true)
   test('data', () => assert.deepEqual(data, {name: 'test'}))

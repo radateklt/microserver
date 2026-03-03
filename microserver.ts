@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.7
+ * @version 3.0.8
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -95,9 +95,11 @@ export interface Middleware {
   plugin?: Plugin;
 }
 
+/** Plugin with constructor: new(options: any, server: MicroServer) */
 export abstract class Plugin {
   name?: string
   priority?: number
+  init?(): Promise<void> | void
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
 }
@@ -737,9 +739,15 @@ export class MicroServer extends EventEmitter {
       return
 
     this._worker.startJob()
-    for (let i = 0; i < args.length; i++)
+    for (let i = 0; i < args.length; i++) {
       if (args[i] instanceof Promise)
         args[i] = await args[i]
+    }
+    args = args.filter(arg => arg) as any
+    if (!args[0]) {
+      this._worker.endJob()
+      return
+    }
 
     // use(plugin)
     if (args[0] instanceof Plugin) {
@@ -815,6 +823,8 @@ export class MicroServer extends EventEmitter {
 
   // @internal
   private async _plugin(plugin: Plugin): Promise<void> {
+    if (plugin.init)
+      await plugin.init()
     if (plugin.handler) {
       const middleware: Middleware = plugin.handler.bind(plugin)
       middleware.plugin = plugin
@@ -846,18 +856,18 @@ export class MicroServer extends EventEmitter {
   }
 
   /** Get plugin */
-  getPlugin (id: string): Plugin | undefined {
-    return this._plugins[id]
+  getPlugin<T extends Plugin>(id: string): T | undefined {
+    return this._plugins[id] as T
   }
 
   /** Wait for plugin */
-  async waitPlugin (id: string): Promise<Plugin> {
+  async waitPlugin<T extends Plugin>(id: string): Promise<T> {
     const p = this.getPlugin(id)
     if (p)
-      return p
+      return p as T
     this._worker.startJob('plugin:' + id)
     await this._worker.wait('plugin:' + id)
-    return this.getPlugin(id)!
+    return this.getPlugin(id)! as T
   }
 
   /** Add route, alias to `server.use(url, ...args)` */
@@ -2506,7 +2516,7 @@ export class Auth {
       const token = await this.token(this.options.objectToken ? JSON.stringify(usrInfo) : (usrInfo?.id || usrInfo?._id), undefined, expire)
       
       if (token && this.res && this.req) {
-        const oldToken: string | undefined = (this.req as any).tokenId
+        const oldToken: string | undefined = this.req.tokenId
         if (oldToken)
           delete this.options.cache?.[oldToken]
         this.req.tokenId = token
@@ -2522,7 +2532,7 @@ export class Auth {
   /** Logout logged in user */
   logout (): void {
     if (this.req && this.res) {
-      const oldToken: string | undefined = (this.req as any).tokenId
+      const oldToken: string | undefined = this.req.tokenId
       if (oldToken)
         delete this.options.cache?.[oldToken]
       if (this.options.mode === 'cookie')
@@ -2750,7 +2760,7 @@ export class AuthPlugin extends Plugin {
       }
 
       // check in cache
-      (req as any).tokenId = token
+      req.tokenId = token
       let usrCache = cache?.[token]
       if (usrCache && usrCache.time > now)
         [req.user, expire] = [usrCache.data, Math.floor((usrCache.time - now) / 1000)]
@@ -3066,17 +3076,105 @@ export interface FileStoreOptions {
   /** Base directory */
   dir?: string
   /** Cache timeout in milliseconds */
-  cacheTimeout?: number
+  cacheTime?: number
   /** Max number of cached items */
   cacheItems?: number
   /** Debounce timeout in milliseconds for autosave */
-  debounceTimeout?: number
+  debounceTime?: number
 }
 
 interface FileItem {
   atime: number
   mtime: number
   data: any
+}
+
+const IS_OBSERVED = Symbol('is_observed');
+
+/** Observe data object, and trigger callback on change for each property. Recursive properties will have key like `a.b.c` */
+export function observe (data: object, cb: (data: object, key: string, value: any) => void, options?: {debounceTime?: number, recursive?: boolean}): object {
+  function debounce(func: (...args: any) => void, debounceTime: number): Function | any {
+    const maxTotalDebounceTime: number = debounceTime * 2
+    let timeoutId: any
+    let lastCallTime = Date.now()
+    let _args: any
+
+    const abort = () => {
+      if (timeoutId)
+        clearTimeout(timeoutId)
+      _args = undefined
+      timeoutId = undefined
+    }
+    const exec = () => {
+      const args = _args
+      if (args) {
+        abort()
+        lastCallTime = Date.now()
+        func(...args)
+      }
+    }
+    const start = (...args: any) => {
+      const currentTime = Date.now()
+      const timeSinceLastCall = currentTime - lastCallTime
+      abort()
+      if (timeSinceLastCall >= maxTotalDebounceTime) {
+        func(...args)
+        lastCallTime = currentTime
+      } else {
+        _args = args
+        timeoutId = setTimeout(exec, Math.max(debounceTime - timeSinceLastCall, 0))
+      }
+    }
+    start.abort = abort
+    start.immediate = exec
+    return start
+  }
+
+  const changed = options?.debounceTime === 0 ?
+    (target: Record<string, any>, key: string, baseKey: string) => cb.call(data, target, baseKey + key, target[key]) :
+    debounce((target: Record<string, any>, key: string, baseKey: string) => cb.call(data, target, baseKey + key, target[key]), options?.debounceTime ?? 100)
+  const observe = (data: any, baseKey: string) => {
+    if (typeof data !== 'object' || data === null)
+      return data
+    const handler = {
+      get(target: Record<string, any>, key: string) {
+        if (key === '__sync__')
+          return changed.immediate
+        if (key === IS_OBSERVED as any)
+          return true
+        if (typeof target[key] === 'object' && target[key] !== null)
+          return new Proxy(target[key], handler)
+        return target[key]
+      },
+      set(target: Record<string, any>, key: string, value: any) {
+        if (target[key] === value)
+          return true
+        if (typeof value === 'object' && value !== null) {
+          const newValue = Array.isArray(value) ? [...value] : {...value}
+          value = options?.recursive ? observe(newValue, baseKey + key + '.') : newValue
+        }
+        target[key] = value
+        changed(target, key, baseKey)
+        return true
+      },
+      deleteProperty(target: Record<string, any>, key: string) {
+        delete target[key]
+        changed(target, key, baseKey)
+        return true
+      }
+    }
+    if (options?.recursive)
+      for (const key in data)
+        if (typeof data[key] === 'object' && data[key] !== null)
+          data[key] = observe(data[key], baseKey + key + '.')
+    return new Proxy(data, handler)
+  }
+  return observe(data, '')
+}
+
+/** Check if data object is observed */
+export function isObserved(data: any) {
+  return data[IS_OBSERVED]
 }
 
 /** JSON File store */
@@ -3086,20 +3184,20 @@ export class FileStore {
   // @internal
   private _dir: string
   // @internal
-  private _cacheTimeout: number
+  private _cacheTime: number
   // @internal
   private _cacheItems: number
   // @internal
-  private _debounceTimeout: number
+  private _debounceTime: number
   // @internal
   private _iter: number
 
   constructor (options?: FileStoreOptions) {
     this._cache = {}
     this._dir = options?.dir || 'data'
-    this._cacheTimeout = options?.cacheTimeout || 2000
+    this._cacheTime = options?.cacheTime || 2000
     this._cacheItems = options?.cacheItems || 10
-    this._debounceTimeout = options?.debounceTimeout ?? 1000
+    this._debounceTime = options?.debounceTime ?? 1000
     this._iter = 0
   }
 
@@ -3111,7 +3209,7 @@ export class FileStore {
       const keys = Object.keys(this._cache)
       if (keys.length > this._cacheItems) {
         keys.forEach(n => {
-          if (now - this._cache[n].atime > this._cacheTimeout)
+          if (now - this._cache[n].atime > this._cacheTime)
             delete this._cache[n]
         })
       }
@@ -3154,12 +3252,12 @@ export class FileStore {
   /** load json file data */
   async load (name: string, autosave: boolean = false): Promise<any> {
     let item: FileItem = this._cache[name]
-    if (item && new Date().getTime() - item.atime < this._cacheTimeout)
+    if (item && new Date().getTime() - item.atime < this._cacheTime)
       return item.data
 
     return this._sync(async () =>  {
       item = this._cache[name]
-      if (item && new Date().getTime() - item.atime < this._cacheTimeout)
+      if (item && new Date().getTime() - item.atime < this._cacheTime)
         return item.data
       try {
         const stat = await fs.promises.lstat(path.join(this._dir, name)).catch(() => null)
@@ -3168,7 +3266,7 @@ export class FileStore {
           this._iter++
           this.cleanup()
           if (autosave)
-            data = this.observe(data, () => this.save(name, data))
+            data = observe(data, () => this.save(name, data), {debounceTime: this._debounceTime, recursive: true})
           this._cache[name] = {
             atime: new Date().getTime(),
             mtime: stat?.mtime.getTime() || new Date().getTime(),
@@ -3205,13 +3303,13 @@ export class FileStore {
   }
 
   /** load all files in directory */
-  async all (name: string, autosave: boolean = false): Promise<Record<string, any>> {
+  async all (subDir?: string, autosave: boolean = false): Promise<Record<string, any>> {
     return this._sync(async () =>  {
-      const files = await fs.promises.readdir(name ? path.join(this._dir, name) : this._dir)
+      const files = await fs.promises.readdir(path.join(this._dir, subDir || ''))
       const res: Record<string, any> = {}
       await Promise.all(files.map(file => 
         (file.startsWith('.') && !file.startsWith('_') && !file.startsWith('$')) &&
-          this.load(name ? name + '/' + file : file, autosave)
+          this.load(path.join(subDir || '', file), autosave)
             .then(data => {res[file] = data})
       ))
       return res
@@ -3229,72 +3327,6 @@ export class FileStore {
       } catch {
       }
     })
-  }
-
-  /** Observe data object */
-  observe (data: object, cb: (data: object, key: string, value: any) => void): object {
-    function debounce(func: (...args: any) => void, debounceTime: number): Function | any {
-      const maxTotalDebounceTime: number = debounceTime * 2
-      let timeoutId: any
-      let lastCallTime = Date.now()
-      let _args: any
-
-      const abort = () => {
-        if (timeoutId)
-          clearTimeout(timeoutId)
-        _args = undefined
-        timeoutId = undefined
-      }
-      const exec = () => {
-        const args = _args
-        if (args) {
-          abort()
-          lastCallTime = Date.now()
-          func(...args)
-        }
-      }
-      const start = (...args: any) => {
-        const currentTime = Date.now()
-        const timeSinceLastCall = currentTime - lastCallTime
-        abort()
-        if (timeSinceLastCall >= maxTotalDebounceTime) {
-          func(...args)
-          lastCallTime = currentTime
-        } else {
-          _args = args
-          timeoutId = setTimeout(exec, Math.max(debounceTime - timeSinceLastCall, 0))
-        }
-      }
-      start.abort = abort
-      start.immediate = exec
-      return start
-    }
-
-    const changed = debounce((target: {[key: string]: any}, key: string) => cb.call(data, target, key, target[key]), this._debounceTimeout)
-    const handler = {
-      get(target: {[key: string]: any}, key: string) {
-        if (key === '__sync__')
-          return changed.immediate
-        if (typeof target[key] === 'object' && target[key] !== null)
-          return new Proxy(target[key], handler)
-        return target[key]
-      },
-      set(target: {[key: string]: any}, key: string, value: any) {
-        if (target[key] === value)
-          return true
-        if (value && typeof value === 'object')
-          value = {...value}
-        target[key] = value
-        changed(target, key)
-        return true
-      },
-      deleteProperty(target: {[key: string]: any}, key: string) {
-        delete target[key]
-        changed(target, key)
-        return true
-      }
-    }
-    return new Proxy(data, handler)
   }
 }
 
@@ -3952,7 +3984,7 @@ export class MicroCollectionStore {
 
   constructor (dataPath?: string, storeTimeDelay?: number) {
     if (dataPath)
-      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, ''), debounceTimeout: storeTimeDelay ?? 1000})
+      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, ''), debounceTime: storeTimeDelay ?? 1000})
     if (!Model.db)
       Model.db = this
   }
