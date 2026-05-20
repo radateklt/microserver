@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.8
+ * @version 3.0.9
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -104,7 +104,7 @@ export abstract class Plugin {
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
 }
 
-interface PluginClass {
+export interface PluginClass {
   new(options: any, server: MicroServer): Plugin
 }
 
@@ -479,7 +479,7 @@ export class MicroServer extends EventEmitter {
   /** All sockets */
   public sockets: Set<net.Socket> | undefined
   /** Server instances */
-  public servers: Set<net.Server> | undefined
+  public servers: Set<net.Server | http.Server | tls.Server | https.Server> | undefined
 
   /** @param {MicroServerConfig} [config] MicroServer configuration  */
   constructor (config?: MicroServerConfig) {
@@ -560,7 +560,7 @@ export class MicroServer extends EventEmitter {
     listen.split(',').forEach(listen => {
       this._worker.startJob('listen')
       let {proto, host, port} = reg.exec(listen)?.groups || {}
-      let srv: net.Server | http.Server | https.Server
+      let srv: net.Server | tls.Server | https.Server | http.Server
       switch (proto) {
         case 'tcp':
           if (!config?.handler)
@@ -1788,6 +1788,7 @@ export class WebSocketPlugin extends Plugin {
 
   // @internal
   private _addUpgradeHandler (srv: http.Server) {
+    // @ts-ignore
     if (!srv.listeners('upgrade').includes(this._handler as any))
       srv.on('upgrade', this._handler)
   }
