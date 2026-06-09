@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.9
+ * @version 3.0.10
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -96,17 +96,18 @@ export interface Middleware {
 }
 
 /** Plugin with constructor: new(options: any, server: MicroServer) */
-export abstract class Plugin {
+export class Plugin {
   name?: string
   priority?: number
+  constructor (options?: any, server?: MicroServer) {}
   init?(): Promise<void> | void
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
 }
 
-export interface PluginClass {
+/*export interface PluginClass {
   new(options: any, server: MicroServer): Plugin
-}
+}*/
 
 export type ServerRequestBody<T = any> = T extends Model<infer U extends ModelSchema> ? ModelDocument<U> : Record<string, any>
 
@@ -734,7 +735,7 @@ export class MicroServer extends EventEmitter {
    */
   async use (...args:
     [Middleware|Plugin|ControllerClass|RoutesSet]|[Promise<Middleware|Plugin|ControllerClass|RoutesSet>]
-    |RoutesList|[RouteURL, RoutesSet]|[PluginClass|Promise<PluginClass>, options?: any]): Promise<void> {
+    |RoutesList|[RouteURL, RoutesSet]|[typeof Plugin|Promise<typeof Plugin>, options?: any]): Promise<void> {
     if (!args[0])
       return
 
@@ -755,10 +756,10 @@ export class MicroServer extends EventEmitter {
       return this._worker.endJob()
     }
 
-    // use(PluginClass, options?: any)
+    // use(plugin: typeof Plugin, options?: any)
     if (typeof args[0] === 'function' && args[0].prototype instanceof Plugin) {
       const pluginid = args[0].name.toLowerCase().replace(/plugin$/, '')
-      const plugin = new (args[0] as PluginClass)(args[1] || this.config[pluginid], this)
+      const plugin = new (args[0] as typeof Plugin)(args[1] || this.config[pluginid], this)
       await this._plugin(plugin)
       return this._worker.endJob()
     }

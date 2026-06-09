@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "types": ["node"],
+    "declaration": true,
+    "module": "nodenext",
+    "target": "es2023",
+    "stripInternal": true,
+    "outDir": "./dist"
+  },
+  "files": ["microserver.ts"]
+}

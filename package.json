@@ -1,6 +1,6 @@
 {
   "name": "@radatek/microserver",
-  "version": "3.0.9",
+  "version": "3.0.10",
   "description": "HTTP MicroServer",
   "author": "Darius Kisonas",
   "license": "MIT",
@@ -18,7 +18,7 @@
   },
   "scripts": {
     "prepublishOnly": "pnpm build",
-    "build": "pnpm --package typescript dlx tsc -d -m nodenext -t es2023 microserver.ts --stripInternal --outDir dist && sed -E ':a;N;$!ba;s|\"main\":\\s*\"([^\"]+)\\.ts\"[^\\n]*|\"main\": \"\\1.js\",\\n  \"module\": \"\\1.js\",\\n  \"types\": \"\\1.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json > dist/package.json && cp README.md dist/",
+    "build": "pnpm --package typescript dlx tsc && sed -E ':a;N;$!ba;s|\"main\":\\s*\"([^\"]+)\\.ts\"[^\\n]*|\"main\": \"\\1.js\",\\n  \"module\": \"\\1.js\",\\n  \"types\": \"\\1.d.ts\",|;s|,\\n  \"scripts\".*$|\\n}|' package.json > dist/package.json && cp README.md dist/",
     "test": "node test.ts"
   },
   "publishConfig": {
@@ -26,6 +26,6 @@
     "access": "public"
   },
   "devDependencies": {
-    "@types/node": "^25.9.0"
+    "@types/node": "^25.9.2"
   }
 }
