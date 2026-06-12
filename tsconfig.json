@@ -7,5 +7,5 @@
     "stripInternal": true,
     "outDir": "./dist"
   },
-  "files": ["microserver.ts"]
+  "include": ["microserver.ts"]
 }

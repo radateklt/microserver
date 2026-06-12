@@ -191,3 +191,30 @@ class UserController extends Controller<typeof UserModel> {
 
 server.use('/api/user', UserController)
 ```
+
+File store:
+```ts
+import { FileStore } from '@radatek/microserver'
+const store = new FileStore({dir: 'data'})
+// return parsed JSON object and monitors for changes
+const data = await store.load('test.json')
+// automatically saves to file after delay
+data.text = 'new text'
+
+// loads data as string
+const textData = await store.load('data.xml', {rawData: true})
+// saves data as string sequentially
+store.save('data.xml', '<data></data>')
+// uses cache, even if data is not written at that moment
+assert(await store.load('data.xml') === '<data></data>')
+await store.save('data.xml', '<data2></data2>')
+```
+
+Object observer:
+```ts
+import { obsereve } from '@radatek/microserver'
+
+const observedData = obsereve({user:{name:'test'}}, (data, key, value) => console.log(`Data changed: ${key}=${value}`))
+observedData.user.name = 'test2'
+// Output to console: Data changed: user.name=test2
+```

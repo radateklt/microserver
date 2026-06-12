@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.0.10
+ * @version 3.1.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -12,12 +12,14 @@ import net from 'net'
 import tls from 'tls'
 import querystring from 'querystring'
 import { Readable } from 'stream'
-import fs from 'fs'
+import fs from 'fs/promises'
+import { existsSync, unlink, stat, Stats, createWriteStream, WriteStream, createReadStream, readFileSync, watch as fsWatch } from 'fs'
 import path, { basename, extname } from 'path'
 import crypto from 'crypto'
 import zlib from 'zlib'
 import { EventEmitter } from 'events'
 import { nextTick } from 'process'
+import { isArrayBufferView } from 'util/types'
 
 const defaultToken = 'wx)>:ZUqVc+E,u0EmkPz%ZW@TFDY^3vm'
 const defaultExpire = 24 * 60 * 60
@@ -104,10 +106,6 @@ export class Plugin {
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
 }
-
-/*export interface PluginClass {
-  new(options: any, server: MicroServer): Plugin
-}*/
 
 export type ServerRequestBody<T = any> = T extends Model<infer U extends ModelSchema> ? ModelDocument<U> : Record<string, any>
 
@@ -335,7 +333,7 @@ export class ServerResponse<T = any> extends http.ServerResponse {
   send (data: string | Buffer | Error | Readable | object = ''): void {
     if (this.headersSent)
       return
-    if (typeof data === 'object' || this.isJson) {
+    if (typeof data !== 'string' && (typeof data === 'object' || this.isJson)) {
       if (data instanceof Error)
         return this.error(data)
       if (data instanceof Readable)
@@ -527,7 +525,7 @@ export class MicroServer extends EventEmitter {
   /** Listen server, should be used only if config.listen is not set */
   async listen (config: ListenConfig): Promise<void> {
     if (!config && this.config.listen) {
-      console.debug('listen automatically started from constructor')
+      console.debug('Listen allready started from constructor')
       return
     }
     if (!config)
@@ -536,7 +534,7 @@ export class MicroServer extends EventEmitter {
     const handler = config?.handler || this.handler.bind(this)
     const tlsConfig = config ? config.tls : this.config.tls
 
-    const readFile = (data: string | undefined) => data && (data.indexOf('\n') > 0 ? data : fs.readFileSync(data))
+    const readFile = (data: string | undefined) => data && (data.indexOf('\n') > 0 ? data : readFileSync(data))
     function tlsOptions(): tls.SecureContextOptions {
       return {
         cert: readFile(tlsConfig?.cert),
@@ -547,7 +545,7 @@ export class MicroServer extends EventEmitter {
     function tlsOptionsReload(srv: tls.Server | https.Server) {
       if (tlsConfig?.cert && tlsConfig.cert.indexOf('\n') < 0) {
         let debounce: NodeJS.Timeout | undefined
-        fs.watch(tlsConfig.cert, () => {
+        fsWatch(tlsConfig.cert, () => {
           clearTimeout(debounce)
           debounce = setTimeout(() => {
             debounce = undefined
@@ -1084,7 +1082,13 @@ class RouterPlugin extends Plugin {
   walk(stack: Middleware[], req: ServerRequest, res: ServerResponse, next: Function) {
     const sendData = (data: any) => {
       if (!res.headersSent && !res.closed && data !== undefined) {
-        if ((data === null || typeof data === 'string') && !res.isJson)
+        if (typeof data === 'number') {
+          if (data >= 400)
+            return res.error(data)
+          res.statusCode = data
+          return res.send()
+        }
+        if (data === null && !res.isJson || typeof data !== 'object')
           return res.send(data)
         if (typeof data === 'object' && 
           (data instanceof Buffer || data instanceof Readable || data instanceof Error))
@@ -1333,7 +1337,7 @@ export class UploadPlugin extends Plugin {
     const lookahead = boundary.length + 6;
 
     let lastFile: UploadFile | undefined
-    let fileStream: fs.WriteStream | undefined
+    let fileStream: WriteStream | undefined
     let buffer = Buffer.alloc(0)
 
     const chunkParse = (chunk: Buffer) => {
@@ -1354,7 +1358,7 @@ export class UploadPlugin extends Plugin {
             let filePath
             do {
               filePath = path.resolve(path.join(uploadDir, crypto.randomBytes(16).toString('hex') + '.tmp'))
-            } while (fs.existsSync(filePath))
+            } while (existsSync(filePath))
             buffer = buffer.slice(headerEndIndex + 4)
             lastFile = {
               name: filenameMatch[1],
@@ -1363,7 +1367,7 @@ export class UploadPlugin extends Plugin {
               filePath,
               size: 0
             }
-            fileStream = fs.createWriteStream(filePath)
+            fileStream = createWriteStream(filePath)
             files.push(lastFile)
           } else {
             const nextBoundary = buffer.indexOf(boundary, boundaryIndex + boundary.length)
@@ -1414,7 +1418,7 @@ export class UploadPlugin extends Plugin {
 
       files.forEach(f => {
         if (f.filePath)
-          fs.unlink(f.filePath, NOOP)
+          unlink(f.filePath, NOOP)
         delete f.filePath
       })
       files.splice(0)
@@ -1984,7 +1988,7 @@ export interface ServeFileOptions {
   /** range */
   range?: boolean
   /** stat */
-  stats?: fs.Stats
+  stats?: Stats
 }
 
 const etagPrefix = crypto.randomBytes(4).toString('hex')
@@ -2119,7 +2123,7 @@ export class StaticFilesPlugin extends Plugin {
         return next()
     }
 
-    fs.stat(filename, (err, stats) => {
+    stat(filename, (err, stats) => {
       if (err || stats.isDirectory())
         return next()
 
@@ -2131,7 +2135,7 @@ export class StaticFilesPlugin extends Plugin {
 
       if (this.checkPrecompressedGzip && (req.headers['accept-encoding'] || '').includes('gzip')) {
         const gzipped = filename + '.gz'
-        fs.stat(gzipped, (err, statsGz) => {
+        stat(gzipped, (err, statsGz) => {
           if (!err && statsGz.isFile()) {
             res.setHeader('Content-Encoding', 'gzip')
             filename = gzipped
@@ -2155,7 +2159,7 @@ export class StaticFilesPlugin extends Plugin {
   /** Send static file */
   serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
     const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.root, options.path)
-    const statRes = (err: NodeJS.ErrnoException | null, stats: fs.Stats): void => {
+    const statRes = (err: NodeJS.ErrnoException | null, stats: Stats): void => {
       if (err || !stats.isFile()) {
         if (res.statusCode < 400)
           return res.error(404)
@@ -2197,11 +2201,11 @@ export class StaticFilesPlugin extends Plugin {
           res.setHeader('Content-Length', streamOptions.end - streamOptions.start + 1)
         }        
       }
-      fs.createReadStream(filePath, streamOptions).pipe(res)
+      createReadStream(filePath, streamOptions).pipe(res)
     }
 
     if (!options.stats)
-      fs.stat(filePath, statRes)
+      stat(filePath, statRes)
     else
       statRes(null, options.stats)
   }
@@ -2692,7 +2696,7 @@ export class AuthPlugin extends Plugin {
     }
 
     if (options?.token === defaultToken)
-      console.warn('Default token in auth plugin')
+      console.warn('Default token used in auth plugin')
 
     let token: string | Buffer = options?.token || defaultToken
     if (!token || token.length !== 32)
@@ -3014,25 +3018,30 @@ export class Controller<T extends Model<any> = any> {
 // #region Worker
 class WorkerJob {
   // @internal
-  _promises: any = []
+  _resolve: Function | undefined
+  // @internal
+  _promise: Promise<void> = new Promise(resolve => {this._resolve = resolve})
   // @internal
   _busy: number = 0
 
   start() {
+    if (!this._resolve)
+      this._promise = new Promise(resolve => {this._resolve = resolve})
     this._busy++
   }
 
   end() {
+    if (this._busy <= 0)
+      throw new Error('WorkerJob end with no start')
     this._busy--
-    if (this._busy === 0)
-      for (const resolve of this._promises.splice(0))
-        resolve()
+    if (this._busy === 0) {
+      this._resolve!()
+      this._resolve = undefined
+    }
   }
 
   async wait() {
-    if (!this._busy)
-      return
-    return new Promise<void>(resolve => this._promises.push(resolve))
+    return this._promise
   }
 }
 
@@ -3065,9 +3074,9 @@ class Worker {
   }
 
   async wait(id?: string): Promise<void> {
-    const job = this._jobs[id || 'ready']
+    let job = this._jobs[id || 'ready']
     if (!job)
-      return
+      job = this._jobs[id || 'ready'] = new WorkerJob()
     return job.wait()
   }
 }
@@ -3077,24 +3086,29 @@ class Worker {
 export interface FileStoreOptions {
   /** Base directory */
   dir?: string
-  /** Cache timeout in milliseconds */
+  /** Cache timeout in milliseconds, default: 2000 */
   cacheTime?: number
-  /** Max number of cached items */
+  /** Max number of cached items, default: 10 */
   cacheItems?: number
-  /** Debounce timeout in milliseconds for autosave */
+  /** Debounce timeout in milliseconds for autosave, default: 1000 */
   debounceTime?: number
+  /** Auto save data, default: true */
+  autoSave?: boolean
+  /** Return raw string on load or parsed JSON, default: fase */
+  rawData?: boolean
 }
 
 interface FileItem {
   atime: number
   mtime: number
+  sync?: boolean
   data: any
 }
 
 const IS_OBSERVED = Symbol('is_observed');
 
 /** Observe data object, and trigger callback on change for each property. Recursive properties will have key like `a.b.c` */
-export function observe (data: object, cb: (data: object, key: string, value: any) => void, options?: {debounceTime?: number, recursive?: boolean}): object {
+export function observe<T extends object> (data: T, cb: (data: T, key: string, value: any) => void, options?: {debounceTime?: number, recursive?: boolean}): T {
   function debounce(func: (...args: any) => void, debounceTime: number): Function | any {
     const maxTotalDebounceTime: number = debounceTime * 2
     let timeoutId: any
@@ -3133,8 +3147,8 @@ export function observe (data: object, cb: (data: object, key: string, value: an
   }
 
   const changed = options?.debounceTime === 0 ?
-    (target: Record<string, any>, key: string, baseKey: string) => cb.call(data, target, baseKey + key, target[key]) :
-    debounce((target: Record<string, any>, key: string, baseKey: string) => cb.call(data, target, baseKey + key, target[key]), options?.debounceTime ?? 100)
+    (target: T, key: string, baseKey: string) => cb.call(data, target, baseKey + key, (target as any)[key]) :
+    debounce((target: T, key: string, baseKey: string) => cb.call(data, target, baseKey + key, (target as any)[key]), options?.debounceTime ?? 100)
   const observe = (data: any, baseKey: string) => {
     if (typeof data !== 'object' || data === null)
       return data
@@ -3193,17 +3207,23 @@ export class FileStore {
   private _debounceTime: number
   // @internal
   private _iter: number
+  // @internal
+  private _autoSave: boolean
+  // @internal
+  private _rawData: boolean
 
   constructor (options?: FileStoreOptions) {
     this._cache = {}
     this._dir = options?.dir || 'data'
-    this._cacheTime = options?.cacheTime || 2000
-    this._cacheItems = options?.cacheItems || 10
+    this._cacheTime = options?.cacheTime ?? 2000
+    this._cacheItems = options?.cacheItems ?? 10
     this._debounceTime = options?.debounceTime ?? 1000
+    this._autoSave = options?.autoSave ?? true
+    this._rawData = options?.rawData ?? false
     this._iter = 0
   }
 
-  /** cleanup cache */
+  /** Clanup cache */
   cleanup (): void {
     if (this._iter > this._cacheItems) {
       this._iter = 0
@@ -3211,7 +3231,8 @@ export class FileStore {
       const keys = Object.keys(this._cache)
       if (keys.length > this._cacheItems) {
         keys.forEach(n => {
-          if (now - this._cache[n].atime > this._cacheTime)
+          const item = this._cache[n]
+          if (!item.sync && now - item.atime > this._cacheTime)
             delete this._cache[n]
         })
       }
@@ -3225,13 +3246,17 @@ export class FileStore {
   private async _sync(cb: Function): Promise<any> {
     let r: Function
     let p: Promise<any> = new Promise(resolve => r = resolve)
-    this._queue = this._queue.then(async () => {
+    const end = this._queue.then(async () => {
       try {
         r(await cb())
       } catch (e) {
         r(e)
+      } finally {
+        if (this._queue === end)
+          this.cleanup()
       }
     })
+    this._queue = end
     return p
   }
 
@@ -3252,7 +3277,7 @@ export class FileStore {
   }
 
   /** load json file data */
-  async load (name: string, autosave: boolean = false): Promise<any> {
+  async load (name: string, options?: {autoSave?: boolean, rawData?: boolean, encoding?: BufferEncoding}): Promise<any> {
     let item: FileItem = this._cache[name]
     if (item && new Date().getTime() - item.atime < this._cacheTime)
       return item.data
@@ -3262,18 +3287,20 @@ export class FileStore {
       if (item && new Date().getTime() - item.atime < this._cacheTime)
         return item.data
       try {
-        const stat = await fs.promises.lstat(path.join(this._dir, name)).catch(() => null)
+        const stat = await fs.lstat(path.join(this._dir, name)).catch(() => null)
         if (!stat || item?.mtime !== stat.mtime.getTime()) {
-          let data: object = stat ? JSON.parse(await fs.promises.readFile(path.join(this._dir, name), 'utf8').catch(() => '') || '{}') : {}
+          const rawData = await fs.readFile(path.join(this._dir, name), options?.encoding || 'utf8').catch(() => '')
+          let data: any = (options?.rawData ?? this._rawData) ? rawData : stat ? JSON.parse(rawData) : {}
           this._iter++
           this.cleanup()
-          if (autosave)
+          if ((options?.autoSave ?? this._autoSave) && typeof data === 'object' && data !== null)
             data = observe(data, () => this.save(name, data), {debounceTime: this._debounceTime, recursive: true})
-          this._cache[name] = {
-            atime: new Date().getTime(),
-            mtime: stat?.mtime.getTime() || new Date().getTime(),
-            data: data
-          }
+          if (this._cacheItems)
+            this._cache[name] = {
+              atime: new Date().getTime(),
+              mtime: stat?.mtime.getTime() || new Date().getTime(),
+              data: data
+            }
           return data
         }
       } catch {
@@ -3284,34 +3311,40 @@ export class FileStore {
   }
 
   /** save data */
-  async save (name: string, data: any): Promise<any> {
-    this._iter++
+  async save(name: string, data: any, options?: {encoding?: BufferEncoding}): Promise<void> {
+    if (typeof data === 'string' && this._cache[name]?.data === data)
+      return
     const item: FileItem = {
       atime: new Date().getTime(),
       mtime: new Date().getTime(),
+      sync: true,
       data: data
     }
-    this._cache[name] = item
-    this._sync(async () =>  {
-      if (this._cache[name] === item) {
-        this.cleanup()
+    if (this._cacheItems) {
+      this._iter++
+      this._cache[name] = item
+    }
+    return this._sync(async () =>  {
+      if (!this._cacheItems || this._cache[name] === item) {
+        const itemData = item.data
         try {
-          await fs.promises.writeFile(path.join(this._dir, name), JSON.stringify(this._cache[name].data), 'utf8')
+          await fs.writeFile(path.join(this._dir, name), typeof itemData === 'string' || isArrayBufferView(itemData) ? itemData : JSON.stringify(itemData), options?.encoding || 'utf8')
         } catch {
+        } finally {
+          item.sync = false
         }
       }
     })
-    return data
   }
 
   /** load all files in directory */
-  async all (subDir?: string, autosave: boolean = false): Promise<Record<string, any>> {
+  async all (subDir?: string): Promise<Record<string, any>> {
     return this._sync(async () =>  {
-      const files = await fs.promises.readdir(path.join(this._dir, subDir || ''))
+      const files = await fs.readdir(path.join(this._dir, subDir || ''))
       const res: Record<string, any> = {}
       await Promise.all(files.map(file => 
         (file.startsWith('.') && !file.startsWith('_') && !file.startsWith('$')) &&
-          this.load(path.join(subDir || '', file), autosave)
+          this.load(path.join(subDir || '', file))
             .then(data => {res[file] = data})
       ))
       return res
@@ -3325,7 +3358,7 @@ export class FileStore {
       if (this._cache[name])
         return
       try {
-        await fs.promises.unlink(path.join(this._dir, name))
+        await fs.unlink(path.join(this._dir, name))
       } catch {
       }
     })
@@ -3986,7 +4019,7 @@ export class MicroCollectionStore {
 
   constructor (dataPath?: string, storeTimeDelay?: number) {
     if (dataPath)
-      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, ''), debounceTime: storeTimeDelay ?? 1000})
+      this._store = new FileStore({dir: dataPath.replace(/^\w+:\/\//, ''), debounceTime: storeTimeDelay ?? 1000, autoSave: true})
     if (!Model.db)
       Model.db = this
   }
@@ -3994,7 +4027,7 @@ export class MicroCollectionStore {
   /** Get collection */
   async collection(name: string): Promise<MicroCollection> {
     if (!this._collections.has(name)) {
-      const data = await this._store?.load(name, true) || {}
+      const data = await this._store?.load(name) || {}
       this._collections.set(name, new MicroCollection({data, name}))
     }
     return this._collections.get(name) as MicroCollection

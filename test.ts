@@ -378,6 +378,9 @@ test('Controller', async () => {
     async login3() {
       return {data: this.req.body}
     }
+    getloginerr() {
+      return 408
+    }
   }
   const routes = TestController.routes()
   test('POST /login', () => assert(routes.find(o => o[0] === 'POST /login')))
@@ -402,6 +405,8 @@ test('Controller', async () => {
   test('Login3', async () => assert.deepEqual(await POST('/api/login3', {user: 'test3'}), {success: false, error: 'Permission denied'}))
   test('Prm1', async () => assert.deepEqual(await POST('/api/prm1', {}), {success: false, error: 'Permission denied'}))
   test('Prm2', async () => assert.deepEqual(await PUT('/api/prm1/prm2', {}), {success: true, data: {company: 'prm1', id: 'prm2'}}))
+  test('Err', async () => assert.deepEqual(await GET('/api/loginerr'), {success: false, error: 'Error'}))
+  test('Err status', async () => assert.equal((await GET('/api/loginerr', {response: true})).status, 408))
 })
 
 test('Model', async () => {
@@ -516,11 +521,29 @@ test('Model store', async () => {
 test('FileStore', async () => {
   const store = new FileStore({dir: './tmp', debounceTime: 200})
   await fs.writeFile('./tmp/test', JSON.stringify({name: 'test'}))
-  const data = await store.load('test', true)
+  const data = await store.load('test')
   test('data', () => assert.deepEqual(data, {name: 'test'}))
-  test('change', async () => {
+  test('change debounce', async () => {
     data.name = 'test2'
     assert.equal(await fs.readFile('./tmp/test', 'utf8'), JSON.stringify({name: 'test'}))
+  })
+  test('change sync', async () => {
+    await store.sync()
+    assert.equal(await fs.readFile('./tmp/test', 'utf8'), JSON.stringify({name: 'test2'}))
+  })
+  test('raw read', async () => {
+    await fs.writeFile('./tmp/test2', '["test"]', 'utf8')
+    const data = await store.load('test')
+    assert.equal(await await store.load('test2', {rawData: true}), '["test"]')
+  })
+  test('raw write', async () => {
+    let saved = 0
+    for (let i = 1; i <= 100; i++)
+      store.save('test2', 'test' + i).then(() => saved++)
+    assert.equal(await store.load('test2'), 'test100', 'Cache store not used')
+    assert(saved < 100, 'Cache load not used')
+    await store.sync()
+    assert.equal(await fs.readFile('./tmp/test2', 'utf8'), 'test100')
   })
   test('close', async () => {
     data.name = 'test3'
@@ -535,6 +558,21 @@ test('Stop server', async () => {
   assert(server.servers?.size === 0, 'Server not closed')
 
   await new Promise(resolve => setTimeout(resolve, 10)) // closing listening port needs some time
+})
+
+test('wait', async () => {
+  let ready = 0
+  const sleep = () => new Promise((resolve: Function) => setTimeout(() => resolve(), 50))
+  server.waitPlugin('testP1').then(() => ready++)
+  await sleep()
+  assert.equal(ready, 0)
+  class TestP1 extends Plugin {
+    name: string = 'testP1'
+  }
+  server.use(TestP1)
+  server.waitPlugin('testP1').then(() => ready++)
+  await sleep()
+  assert.equal(ready, 2)
 })
 
 test('Auth', async () => {
