@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.1.0
+ * @version 3.2.0
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -97,11 +97,29 @@ export interface Middleware {
   plugin?: Plugin;
 }
 
+export interface MiddlewareHandler {
+  handler (req: ServerRequest, res: ServerResponse): any
+}
+
+let preparePluginServer: MicroServer, preparePluginConfig: any
+
 /** Plugin with constructor: new(options: any, server: MicroServer) */
-export class Plugin {
+export class Plugin<T = any> {
   name?: string
   priority?: number
-  constructor (options?: any, server?: MicroServer) {}
+  server!: MicroServer
+  _options!: T
+  constructor (options?: T, server?: MicroServer) {
+    this.server = server ?? preparePluginServer
+    this._options = options ?? preparePluginConfig
+  }
+  get options (): T | undefined {
+    if (this._options)
+      return this._options
+    if (this.name && this.server.config)
+      return this._options = this.server.config[this.name]
+  }
+  set options (value: T) { this._options = value }
   init?(): Promise<void> | void
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void
   routes?(): Promise<RoutesSet|void> | RoutesSet | void
@@ -423,9 +441,9 @@ export class ServerResponse<T = any> extends http.ServerResponse {
 
 type RouteURL = `${Uppercase<string>} /${string}`|`/${string}`
 type StringMiddleware = `response:json`|`response:html`|`response:end`|`redirect:${string}`|`error:${number}`|`param:${string}=${string}`|`acl:${string}`|`user:${string}`|`group:${string}`|`model:${string}`|`${string}=${string}`
-type RoutesMiddleware = Middleware|Plugin|StringMiddleware|Promise<Middleware|Plugin>
+type RoutesMiddleware = Middleware|MiddlewareHandler|Plugin|StringMiddleware|Promise<Middleware|MiddlewareHandler|Plugin>
 type RoutesList = [RouteURL, ...Array<RoutesMiddleware>]|[RouteURL, ControllerClass|Promise<ControllerClass>]
-type RoutesSet = Array<RoutesList|ControllerClass|Promise<ControllerClass>>|Record<RouteURL,RoutesList|ControllerClass|Promise<ControllerClass>|Middleware>
+type RoutesSet = Array<RoutesList|ControllerClass|Promise<ControllerClass>>|Record<RouteURL,RoutesList|ControllerClass|Promise<ControllerClass>|Middleware|MiddlewareHandler>
 
 //** MicroServer configuration */
 export interface MicroServerConfig extends ListenConfig {
@@ -484,6 +502,7 @@ export class MicroServer extends EventEmitter {
   constructor (config?: MicroServerConfig) {
     super()
     this.config = config || {}
+    this._worker.startJob()
     this.use(this._router)
     if (config) {
       if (this.config.routes)
@@ -493,6 +512,8 @@ export class MicroServer extends EventEmitter {
         nextTick(() => this.listen({listen: this.config.listen}).finally(() => this._worker.endJob()))
       }
     }
+    nextTick(() => this._worker.endJob())
+    this.waitReady().then(() => this.emit('ready'))
   }
 
   on<K extends keyof MicroServerEvents>(event: K, listener: MicroServerEvents[K]): this {
@@ -731,9 +752,9 @@ export class MicroServer extends EventEmitter {
    * Middlewares may return promises for res.jsonSuccess(...), throw errors for res.error(...), return string or {} for res.send(...)
    * RouteURL: 'METHOD /suburl', 'METHOD', '* /suburl'
    */
-  async use (...args:
-    [Middleware|Plugin|ControllerClass|RoutesSet]|[Promise<Middleware|Plugin|ControllerClass|RoutesSet>]
-    |RoutesList|[RouteURL, RoutesSet]|[typeof Plugin|Promise<typeof Plugin>, options?: any]): Promise<void> {
+  async use<T>(...args:
+    [Middleware|Plugin<T>|ControllerClass|RoutesSet]|[Promise<Middleware|Plugin<T>|ControllerClass|RoutesSet>]
+    |RoutesList|[RouteURL, RoutesSet]|[typeof Plugin<T>|Promise<typeof Plugin<T>>, options?: any]): Promise<void> {
     if (!args[0])
       return
 
@@ -756,8 +777,11 @@ export class MicroServer extends EventEmitter {
 
     // use(plugin: typeof Plugin, options?: any)
     if (typeof args[0] === 'function' && args[0].prototype instanceof Plugin) {
-      const pluginid = args[0].name.toLowerCase().replace(/plugin$/, '')
-      const plugin = new (args[0] as typeof Plugin)(args[1] || this.config[pluginid], this)
+      preparePluginServer = this, preparePluginConfig = args[1]
+      // backward compatibility
+      // @ts-ignore
+      const plugin = new (args[0] as typeof Plugin)(args[1], this)
+      preparePluginServer = undefined!, preparePluginConfig = undefined
       await this._plugin(plugin)
       return this._worker.endJob()
     }
@@ -822,6 +846,9 @@ export class MicroServer extends EventEmitter {
 
   // @internal
   private async _plugin(plugin: Plugin): Promise<void> {
+    if (plugin.name)
+      this._worker.startJob(`plugin:${plugin.name}`)
+    const timeout = setTimeout(() => this.emit('error', new Error(`Plugin ${plugin.name||plugin.constructor.name} timeout`)), 10000)
     if (plugin.init)
       await plugin.init()
     if (plugin.handler) {
@@ -835,13 +862,14 @@ export class MicroServer extends EventEmitter {
       if (routes)
         await this.use(routes)
     }
+    clearTimeout(timeout)
     if (plugin.name) {
       if (this._plugins[plugin.name])
         throw new Error(`Plugin ${plugin.name} already added`)
       this._plugins[plugin.name] = plugin
       this.emit('plugin', plugin.name)
-      this.emit('plugin:' + plugin.name)
-      this._worker.endJob('plugin:' + plugin.name)
+      this.emit(`plugin:${plugin.name}`)
+      this._worker.endJob(`plugin:${plugin.name}`)
     }
   }
 
@@ -864,7 +892,6 @@ export class MicroServer extends EventEmitter {
     const p = this.getPlugin(id)
     if (p)
       return p as T
-    this._worker.startJob('plugin:' + id)
     await this._worker.wait('plugin:' + id)
     return this.getPlugin(id)! as T
   }
@@ -1142,20 +1169,21 @@ export interface CorsOptions {
 }
 
 /** CORS plugin. Config may be: true - allow all, string - allow specific origin, or CorsOptions */
-export class CorsPlugin extends Plugin {
+export class CorsPlugin extends Plugin<CorsOptions> {
   priority = -100
   name = 'cors'
 
-  options?: CorsOptions
-  constructor (options?: CorsOptions | string | true) {
+  constructor () {
     super()
+    const options = this.options as any
     if (!options) {
       this.handler = undefined
       return
     }
     if (options === true)
-      options = '*'
-    this.options = typeof options === 'string' ? { origin: options, headers: 'Content-Type', credentials: true } : options
+      this.options = { origin: '*', headers: 'Content-Type', credentials: true }
+    if (typeof options === 'string')
+      this.options = { origin: options, headers: 'Content-Type', credentials: true }
   }
 
   handler?(req: ServerRequest, res: ServerResponse, next: Function): Promise<string | object | void> | string | object | void {
@@ -1179,31 +1207,29 @@ export class CorsPlugin extends Plugin {
 
 // #region MethodsPlugin
 /** Methods plugin to support OPTIONS method, and restrict allowed methods. Configuration is comma separated string  */
-export class MethodsPlugin extends Plugin {
+export class MethodsPlugin extends Plugin<string> {
   priority = -90
   name = 'methods'
 
   // @internal
-  private _methods: string
-  // @internal
   private _methodsIdx: Record<string, boolean>
   
-  constructor(methods?: string) {
+  constructor() {
     super()
-
-    this._methods = methods || defaultMethods
-    this._methodsIdx = this._methods.split(',').reduce((acc, m) => (acc[m] = true, acc), {} as {[key: string]: boolean})
+    if (!this.options)
+      this.options = defaultMethods
+    this._methodsIdx = this.options.split(',').reduce((acc, m) => (acc[m] = true, acc), {} as {[key: string]: boolean})
   }
 
   handler(req: ServerRequest, res: ServerResponse, next: Function) {
     if (req.method === 'GET' || req.headers.upgrade)
       return next()
     if (req.method === 'OPTIONS') {
-      res.setHeader('Allow', this._methods)
+      res.setHeader('Allow', this.options as string)
       return res.status(204).end()
     }
     if (!req.method || !this._methodsIdx?.[req.method]) {
-      res.setHeader('Allow', this._methods)
+      res.setHeader('Allow', this.options as string)
       return res.status(405).end()
     }
     return next()    
@@ -1213,20 +1239,20 @@ export class MethodsPlugin extends Plugin {
 
 // #region BodyPlugin
 export interface BodyOptions {
-  maxBodySize?: number
+  maxBodySize: number
 }
 
 /** Body parser plugin */
-export class BodyPlugin extends Plugin {
+export class BodyPlugin extends Plugin<BodyOptions> {
   priority: number = -80
   name: string = 'body'
 
-  // @internal
-  private _maxBodySize: number
-  
-  constructor (options?: BodyOptions) {
+  constructor () {
     super()
-    this._maxBodySize = options?.maxBodySize || defaultMaxBodySize
+    this.options = {
+      maxBodySize: defaultMaxBodySize,
+      ...this.options as any
+    }
   }
 
   handler(req: ServerRequest, res: ServerResponse, next: () => void) {
@@ -1242,15 +1268,16 @@ export class BodyPlugin extends Plugin {
       res.setHeader('Connection', 'close')
       return next()
     }
+    const maxBodySize = this.options!.maxBodySize
 
-    if (parseInt(req.headers['content-length'] || '-1') > this._maxBodySize) {
+    if (parseInt(req.headers['content-length'] || '-1') > maxBodySize) {
       return req.setReady(new ResponseError("too big", 413))
     }
 
     req.once('error', () => {})
       .on('data', chunk => {
         req.rawBodySize += chunk.length
-        if (req.rawBodySize >= this._maxBodySize)
+        if (req.rawBodySize >= maxBodySize)
           req.setReady(new ResponseError("too big", 413))
         else
           req.rawBody.push(chunk)
@@ -1280,7 +1307,7 @@ export class BodyPlugin extends Plugin {
 // #region UploadPlugin
 export interface UploadOptions {
   uploadDir?: string
-  maxFileSize?: number
+  maxFileSize: number
 }
 
 export interface UploadFile {
@@ -1292,19 +1319,16 @@ export interface UploadFile {
 }
 
 /** Upload plugin, At least uploadDir option is required */
-export class UploadPlugin extends Plugin {
+export class UploadPlugin extends Plugin<UploadOptions> {
   priority: number = -70
   name: string = 'upload'
-
-  // @internal
-  private _maxFileSize: number
-  // @internal
-  private _uploadDir?: string
   
-  constructor (options?: UploadOptions) {
+  constructor () {
     super()
-    this._maxFileSize = options?.maxFileSize || defaultMaxFileSize
-    this._uploadDir = options?.uploadDir
+    this.options = {
+      maxFileSize: defaultMaxFileSize,
+      ...this.options as any
+    }
   }
 
   handler (req: ServerRequest, res: ServerResponse, next: () => void) {
@@ -1316,10 +1340,10 @@ export class UploadPlugin extends Plugin {
 
     req.pause()
     res.setHeader('Connection', 'close')
-    if (!this._uploadDir)
+    if (!this.options!.uploadDir)
       return res.error(405)
 
-    const uploadDir = path.resolve(this._uploadDir)
+    const uploadDir = path.resolve(this.options!.uploadDir)
     const files: UploadFile[] = []
 
     req.files = async (): Promise<UploadFile[]> => {
@@ -1395,7 +1419,7 @@ export class UploadPlugin extends Plugin {
             const safeWriteLength = buffer.length - lookahead
             if (safeWriteLength > 0) {
               lastFile!.size += safeWriteLength
-              if (lastFile!.size > this._maxFileSize) {
+              if (lastFile!.size > this.options!.maxFileSize) {
                 req.setReady(new ResponseError("file too big", 413))
                 return
               }
@@ -1776,19 +1800,19 @@ export class WebSocket extends EventEmitter {
 }
 
 /** WebSocket plugin to support `WEBSOCKET /url` routes */
-export class WebSocketPlugin extends Plugin {
+export class WebSocketPlugin extends Plugin<WebSocketOptions> {
   name: string = 'websocket'
   
   // @internal
   private _handler: (req: ServerRequest, socket: net.Socket, head: any) => void
   
-  constructor (options?: any, server?: MicroServer) {
+  constructor () {
     super()
-    if (!server)
+    if (!this.server)
       throw new Error('Server instance is required')
-    this._handler = this.upgradeHandler.bind(this, server)
-    server.servers?.forEach(srv => this._addUpgradeHandler(srv as any))
-    server.on('listen', (port: number, address: string, srv: http.Server) => this._addUpgradeHandler(srv))
+    this._handler = this.upgradeHandler.bind(this)
+    this.server.servers?.forEach(srv => this._addUpgradeHandler(srv as any))
+    this.server.on('listen', (port: number, address: string, srv: http.Server) => this._addUpgradeHandler(srv))
   }
 
   // @internal
@@ -1798,8 +1822,7 @@ export class WebSocketPlugin extends Plugin {
       srv.on('upgrade', this._handler)
   }
 
-  upgradeHandler (server: MicroServer, req: ServerRequest, socket: net.Socket, head: any) {
-    const host: string = req.headers.host || ''
+  upgradeHandler (req: ServerRequest, socket: net.Socket, head: any) {
     const res: any = {
       req,
       get headersSent (): boolean {
@@ -1807,14 +1830,14 @@ export class WebSocketPlugin extends Plugin {
       },
       statusCode: 200,
       socket,
-      server,
+      servr: this.server,
       end (data?: string): void {
         if (res.headersSent)
           throw new Error('Headers already sent')
         let code = res.statusCode || 403
         if (code < 400) {
           data = 'Invalid WebSocket response'
-          server.emit('error', new Error(data))
+          this.server.emit('error', new Error(data))
           code = 500
         }
         if (!data)
@@ -1841,12 +1864,12 @@ export class WebSocketPlugin extends Plugin {
       getHeader (): undefined { },
       setHeader (): void { }
     }
-    ServerRequest.extend(req, res as any, server)
+    ServerRequest.extend(req, res as any, this.server)
     let ws: WebSocket | undefined
     Object.defineProperty(req, 'websocket', {
       get: () => {
         if (!ws)
-          ws = new WebSocket(req, server.config.websocket)
+          ws = new WebSocket(req, this.options)
         return ws
       },
       enumerable: true
@@ -1854,23 +1877,20 @@ export class WebSocketPlugin extends Plugin {
     if (req.method !== 'GET' || req.headers.upgrade?.toLowerCase() !== 'websocket')
       return res.error(400)
     req.method = 'WEBSOCKET'
-    server.handler(req, res as ServerResponse)
+    this.server.handler(req, res as ServerResponse)
   }
 }
 // #endregion WebSocket
 
 // #region TrustProxyPlugin
 /** Trust proxy plugin, adds `req.ip` and `req.localip` */
-export class TrustProxyPlugin extends Plugin {
+export class TrustProxyPlugin extends Plugin<string[]> {
   priority: number = -60
   name: string = 'trustproxy'
 
-  // @internal
-  private _trustProxy: string[] = []
-
-  constructor (options?: string[]) {
+  constructor () {
     super()
-    this._trustProxy = options || []
+    this.options = this.options || []
   }
 
   isLocal (ip: string) {
@@ -1881,7 +1901,7 @@ export class TrustProxyPlugin extends Plugin {
     req.localip = this.isLocal(req.ip)
     const xip = req.headers['x-real-ip'] || req.headers['x-forwarded-for']
     if (xip) {
-      if (!this._trustProxy.includes(req.ip))
+      if (!this.options!.includes(req.ip))
         return res.error(400)
 
       if (req.headers['x-forwarded-proto'] === 'https')
@@ -1896,17 +1916,17 @@ export class TrustProxyPlugin extends Plugin {
 
 // #region VHostPlugin
 /** Virtual host plugin */
-export class VHostPlugin extends Plugin {
+export class VHostPlugin extends Plugin<Record<string, RoutesSet|MicroServer>> {
   priority = -10
 
   vhosts?: Record<string, MicroServer>
 
-  constructor (options: Record<string, RoutesSet|MicroServer>, server?: MicroServer) {
+  constructor () {
     super()
-    if (!server)
+    if (!this.server)
       throw new Error('Server instance is required')
 
-    const vhostPlugin = server.getPlugin('vhost') as VHostPlugin
+    const vhostPlugin = this.server.getPlugin('vhost') as VHostPlugin
     let vhosts = vhostPlugin?.vhosts
     if (!vhosts) {
       vhosts = this.vhosts = {}
@@ -1914,18 +1934,18 @@ export class VHostPlugin extends Plugin {
     } else {
       this.handler = undefined
     }
-    for (const host in options) {
-      const v = options[host]
+    for (const host in this.options) {
+      const v = this.options[host]
       if (v instanceof MicroServer) {
         vhosts[host] = v
         continue
       }
       if (!vhosts[host])
         vhosts[host] = new MicroServer({})
-      vhosts[host].use(options[host])
+      vhosts[host].use(this.options[host] as RoutesSet)
     }
     if (this.vhosts)
-      server.on('close', () => {
+      this.server.on('close', () => {
         for (const host in this.vhosts)
           this.vhosts[host].emit('close')
       })      
@@ -1951,9 +1971,9 @@ export interface StaticFilesOptions {
   /** url path */
   path?: string,
   /** additional mime types */
-  mimeTypes?: { [key: string]: string },
+  mimeTypes?: Record<string, string>,
   /** file extension handlers */
-  handlers?: { [key: string]: Middleware },
+  handlers?: Record<string, Middleware>,
   /** ignore prefixes */
   ignore?: string[]
   /** index file. default: 'index.html' */
@@ -1994,7 +2014,7 @@ export interface ServeFileOptions {
 const etagPrefix = crypto.randomBytes(4).toString('hex')
 
 /** Static files plugin. At least must be path to public folder as string or StaticFilesOptions */
-export class StaticFilesPlugin extends Plugin {
+export class StaticFilesPlugin extends Plugin<StaticFilesOptions> {
   priority: number = 110
   
   /** Default mime types */
@@ -2021,50 +2041,28 @@ export class StaticFilesPlugin extends Plugin {
     '.tgz': 'application/gzip',
   }
   
-  /** Custom mime types */
-  mimeTypes: { [key: string]: string }
-  /** File extension handlers */
-  handlers?: { [key: string]: Middleware }
-  /** Files root directory */
-  root: string
-  /** Ignore prefixes */
-  ignore: string[]
-  /** Index file. default: 'index.html' */
-  index: string
-  /** Update Last-Modified header. default: true */
-  lastModified: boolean
-  /** Update ETag header. default: true */
-  etag: boolean
-  /** Max file age in seconds (default: 31536000) */
-  maxAge?: number
-
   prefix: string
-
   errors?: Record<string, string>
-  checkPrecompressedGzip?: boolean
 
-  constructor (options?: StaticFilesOptions | string, server?: MicroServer) {
+  constructor (options?: StaticFilesOptions) {
     super()
-    if (!options)
-      options = {}
+    this.options = options = options || this.options || {}
     if (typeof options === 'string')
-      options = { root: options }
+      this.options = options = { root: options }
+    this.options.root = (options.root && path.isAbsolute(options.root) ? options.root : path.resolve(options.root || options?.path || 'public')).replace(/[\/\\]$/, '') + path.sep
 
-    this.mimeTypes = options.mimeTypes ? { ...StaticFilesPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticFilesPlugin.mimeTypes)
-    this.root = (options.root && path.isAbsolute(options.root) ? options.root : path.resolve(options.root || options?.path || 'public')).replace(/[\/\\]$/, '') + path.sep
-    this.ignore = (options.ignore || []).map((p: string) => path.normalize(path.join(this.root, p)) + path.sep)
-    this.index = options.index || 'index.html'
-    this.handlers = options.handlers
-    this.lastModified = options.lastModified !== false
-    this.etag = options.etag !== false
-    this.maxAge = options.maxAge
-    this.errors = options.errors
-    this.checkPrecompressedGzip = options.precompressedGzip
+    Object.assign(this.options, {
+      mimeTypes: options?.mimeTypes ? { ...StaticFilesPlugin.mimeTypes, ...options.mimeTypes } : Object.freeze(StaticFilesPlugin.mimeTypes),
+      ignore: (options?.ignore || []).map((p: string) => path.normalize(path.join(options.root!, p)) + path.sep),
+      index: options?.index || 'index.html',
+      lastModified: options?.lastModified !== false,
+      etag: options?.etag !== false
+    })
 
-    this.prefix = ('/' + (options.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '')).replace(/\/$/, '')
+    this.prefix = ('/' + (options?.path?.replace(/^[.\/]*/, '') || '').replace(/\/$/, '')).replace(/\/$/, '')
 
-    if (server && !server.getPlugin('static')) {
-      this.name = 'static' // only first plugin instance is registered as
+    if (this.server && !this.server.getPlugin('static')) {
+      this.name = 'static' // only first plugin instance is registered as plugin
 
       const defSend = ServerResponse.prototype.send
 
@@ -2100,9 +2098,10 @@ export class StaticFilesPlugin extends Plugin {
       } else
         return next()
     }
+    const options = this.options as StaticFilesOptions
 
-    let filename = path.normalize(path.join(this.root, req.params.path))
-    if (!filename.startsWith(this.root)) // check root access
+    let filename = path.normalize(path.join(options.root!, req.params.path))
+    if (!filename.startsWith(options!.root!)) // check root access
       return next()
 
     const firstch = basename(filename)[0]
@@ -2110,16 +2109,16 @@ export class StaticFilesPlugin extends Plugin {
       return next()
 
     if (filename.endsWith(path.sep))
-      filename += this.index
+      filename += options.index
 
-    const ext = path.extname(filename)
-    const mimeType = this.mimeTypes[ext]
+    const ext: string = path.extname(filename)
+    const mimeType = options.mimeTypes![ext]
     if (!mimeType)
       return next()
 
     // check ignore access
-    for (let i = 0; i < this.ignore.length; i++) {
-      if (filename.startsWith(this.ignore[i]))
+    for (let i = 0; i < options.ignore!.length; i++) {
+      if (filename.startsWith(options.ignore![i]))
         return next()
     }
 
@@ -2127,13 +2126,13 @@ export class StaticFilesPlugin extends Plugin {
       if (err || stats.isDirectory())
         return next()
 
-      const handler = this.handlers?.[ext]
+      const handler = options.handlers?.[ext]
       if (handler) {
         (req as any).filename = filename
         return handler.call(this, req, res, next)
       }
 
-      if (this.checkPrecompressedGzip && (req.headers['accept-encoding'] || '').includes('gzip')) {
+      if (options.precompressedGzip && (req.headers['accept-encoding'] || '').includes('gzip')) {
         const gzipped = filename + '.gz'
         stat(gzipped, (err, statsGz) => {
           if (!err && statsGz.isFile()) {
@@ -2158,7 +2157,7 @@ export class StaticFilesPlugin extends Plugin {
 
   /** Send static file */
   serveFile (req: ServerRequest, res: ServerResponse, options: ServeFileOptions) {
-    const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.root, options.path)
+    const filePath: string = path.isAbsolute(options.path) ? options.path : path.join(options.root || this.options!.root!, options.path)
     const statRes = (err: NodeJS.ErrnoException | null, stats: Stats): void => {
       if (err || !stats.isFile()) {
         if (res.statusCode < 400)
@@ -2171,7 +2170,7 @@ export class StaticFilesPlugin extends Plugin {
         if (options.mimeType)
           res.setHeader('Content-Type', options.mimeType)
         else
-          res.setHeader('Content-Type', this.mimeTypes[path.extname(options.path)] || 'application/octet-stream')
+          res.setHeader('Content-Type', this.options!.mimeTypes![path.extname(options.path)] || 'application/octet-stream')
       }
       if (options.filename)
         res.setHeader('Content-Disposition', 'attachment; filename="' + (options.filename === true ? path.basename(options.path) : options.filename) + '"')
@@ -2228,7 +2227,7 @@ export interface ProxyOptions {
 }
 
 /** Reverse proxy plugin, At least remote url as string or in ProxyOptions is required */
-export class ProxyPlugin extends Plugin {
+export class ProxyPlugin extends Plugin<ProxyOptions> {
   priority = 120
 
   /** Default valid headers */
@@ -2259,17 +2258,19 @@ export class ProxyPlugin extends Plugin {
   /** Match regex filter */
   regex?: RegExp
 
-  constructor (options?: ProxyOptions | string, server?: MicroServer) {
+  constructor () {
     super()
-    if (typeof options !== 'object')
-      options = { remote: options }
-    if (!options.remote)
-      throw new Error('Invalid param')
+    if (typeof this.options !== 'object')
+      this.options = { remote: this.options }
+    if (!this.options.remote)
+      throw new Error('Missing remote url')
+    const options = this.options as ProxyOptions
+    const server = this.server
 
     if (server && !server.getPlugin('proxy'))
       this.name = 'proxy'
 
-    this.remoteUrl = new URL(options.remote)
+    this.remoteUrl = new URL(this.options.remote)
     this.regex = options.match ? new RegExp(options.match) : undefined
 
     this.headers = options.headers
@@ -2675,54 +2676,50 @@ async function login (username, password, salt) {
 */
 
 /** Authentication plugin */
-export class AuthPlugin extends Plugin {
+export class AuthPlugin extends Plugin<AuthOptions> {
   priority = 50
   name: string = 'auth'
 
-  options: AuthOptions
-  constructor (options?: AuthOptions, server?: MicroServer) {
+  constructor () {
     super()
-    if (!server)
+    if (!this.server)
       throw new Error('Server instance is required')
 
-    this.options = {
+    const options = this.options = {
       mode: 'cookie',
       token: defaultToken,
       expire: defaultExpire,
       defaultAcl: { '*': false },
       cache: {},
-      ...options,
+      ...this.options as any,
       cacheCleanup: new Date().getTime()
     }
 
     if (options?.token === defaultToken)
       console.warn('Default token used in auth plugin')
 
-    let token: string | Buffer = options?.token || defaultToken
+    let token: string | Buffer = this.options!.token || defaultToken
     if (!token || token.length !== 32)
       token = defaultToken
     if (token.length !== 32)
       token = crypto.createHash('sha256').update(token).digest()
     if (!(token instanceof Buffer))
       token = Buffer.from(token as string)
-    this.options.token = token
+    options.token = token
 
-    if (typeof options?.users === 'function')
-      this.options.users = (usr, psw) => (options.users as (usr: string, psw?: string) => Promise<UserInfo|undefined>)(usr, psw)
-    else {
-      this.options.users = async (usrid, psw) => {
-        const users: {[key: string]: UserInfo} | undefined = this.options.users as {[key: string]: UserInfo}
+    if (typeof options.users === 'object')
+      options.users = async (usrid: string, psw: string) => {
+        const users: Record<string, UserInfo> | undefined = this.options!.users as Record<string, UserInfo>
         const usr: UserInfo | undefined = users?.[usrid]
-        if (usr && (psw === undefined || server.auth?.checkPassword(usrid, psw, usr.password || '')))
+        if (usr && (psw === undefined || this.server.auth?.checkPassword(usrid, psw, usr.password || '')))
           return usr
       }
-    }
-    server.auth = new Auth(this.options as AuthOptionsInternal)
+    this.server.auth = new Auth(this.options as AuthOptionsInternal)
   }
 
   /** Authentication middleware */
   async handler (req: ServerRequest, res: ServerResponse, next: Function) {
-    const options: AuthOptions = this.options, cache = options.cache
+    const options: AuthOptions = this.options!, cache = options.cache
     const auth = new Auth(this.options as AuthOptionsInternal, req, res)
     
     const authorization = req.headers.authorization || '';
@@ -2804,21 +2801,15 @@ export class AuthPlugin extends Plugin {
 
 /** Load standard plugins with predefined configs: MethodsPlugin, CorsPlugin, TrustProxyPlugin, BodyPlugin, AuthPlugin, StaticFilesPlugin */
 export class StandardPlugins extends Plugin {
-  constructor (options?: any, server?: MicroServer) {
+  constructor () {
     super()
-    if (!server)
-      throw new Error('Server instance is required')
-    const config = server.config || {}
-    const use = (plugin: any, id?: string) => {
-      if (!id)
-        server.use(plugin)
-      else if (id in config)
-        server.use(plugin, config[id])
-    }
+    const config = this.server.config || {}
+    const server = this.server
+    function use<T>(plugin: typeof Plugin<T>, id?: string) {server.use(plugin, config[id!])}
     use(MethodsPlugin)
-    use(CorsPlugin, 'cors')
-    use(TrustProxyPlugin, 'trustproxy')
-    use(AuthPlugin, 'auth')
+    use(CorsPlugin)
+    use(TrustProxyPlugin)
+    use(AuthPlugin)
     use(BodyPlugin)
     use(StaticFilesPlugin, 'static')
   }
