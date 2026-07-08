@@ -241,7 +241,7 @@ test('Routes: POST', async () => {
   test('tree test2', () => assert.equal((server as any)._router._tree.POST?._next?.test2?._withParam?._last?.length, 1))
   test('tree test3', () => assert.equal((server as any)._router._tree.POST?._next?.test3?._withParam?._last?.length, 1))
   test('json Not found', async() => assert.deepEqual((await POST('/test2', {a: 'test2-a'})), 'Not found'))
-  test('json', async() => assert.deepEqual((await POST('/test2/prm', {b: 'test2-b'})), {success: true, id: 'prm'}))
+  test('json', async() => assert.deepEqual((await POST('/test2/prm', {b: 'test2-b'})), {success: true, id: 'prm', data: {}}))
   test('json exception', async() => assert.deepEqual((await POST('/test3/prm/error', {b: 'test2-b'})), {success: false, error: 'Access denied'}))
   test('GET Not found', async() => assert.equal(await GET('/test2'), 'Not found'))
 })

@@ -1,6 +1,6 @@
 /**
  * MicroServer
- * @version 3.2.0
+ * @version 3.2.1
  * @package @radatek/microserver
  * @copyright Darius Kisonas 2022
  * @license MIT
@@ -168,7 +168,7 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
   public rawBodySize!: number
 
   // @internal
-  private _body?: ServerRequestBody<T>
+  private _body!: ServerRequestBody<T>
   // @internal
   private _isReady: DeferPromise | undefined
   
@@ -193,6 +193,7 @@ export class ServerRequest<T = any> extends http.IncomingMessage {
       path: '/',
       pathname: '/',
       baseUrl: '/',
+      _body: {},
       rawBody: [],
       rawBodySize: 0
     })
